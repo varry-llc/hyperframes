@@ -11,6 +11,7 @@ import {
   type PresenterMediaAction,
   type PresenterMediaMessage,
 } from "./slideshowPresenter";
+import { OwnedMediaRegistry } from "./owned-media-registry";
 
 interface Hotspot {
   id: string;
@@ -68,9 +69,18 @@ type PlayerElement = HTMLElement & {
   readonly ready: boolean;
 };
 
-type SlideshowMediaElement = HTMLMediaElement & {
-  dataset: DOMStringMap;
-};
+type SlideshowMediaElement = HTMLMediaElement;
+
+const SLIDESHOW_MEDIA_ACTIONS = [
+  "play",
+  "pause",
+  "seeking",
+  "seeked",
+  "ratechange",
+  "volumechange",
+  "ended",
+  "timeupdate",
+] as const satisfies readonly PresenterMediaAction[];
 
 /** True when the keydown originated in a text-entry control (typing must never
  *  navigate the deck). Duck-typed so it works for events from the composition
@@ -88,6 +98,30 @@ function isPlayerElement(el: HTMLElement): el is PlayerElement {
     typeof (el as PlayerElement).play === "function" &&
     typeof (el as PlayerElement).pause === "function"
   );
+}
+
+/** What init needs from the element's subtree, or why it cannot start yet. */
+export type SlideshowParts =
+  | { kind: "ready"; player: HTMLElement; manifest: SlideshowManifest }
+  | { kind: "incomplete"; reason: "no-player" | "no-island" | "malformed-island" };
+
+/** Classify the subtree. Reads the DOM, decides nothing about timing. */
+export function locateSlideshowParts(root: Element): SlideshowParts {
+  const player = root.querySelector("hyperframes-player");
+  if (!(player instanceof HTMLElement)) return { kind: "incomplete", reason: "no-player" };
+  let manifest: ReturnType<typeof parseSlideshowManifest>;
+  try {
+    manifest = parseSlideshowManifest(root.innerHTML);
+  } catch {
+    return { kind: "incomplete", reason: "malformed-island" };
+  }
+  if (!manifest) return { kind: "incomplete", reason: "no-island" };
+  return { kind: "ready", player, manifest };
+}
+
+/** Parser-inserted children are all present once the document leaves `loading`. */
+export function childrenMayStillArrive(readyState: DocumentReadyState): boolean {
+  return readyState === "loading";
 }
 
 const PRESENTER_NOTES_STORAGE_PREFIX = "hf-slideshow:presenter-notes:v1:";
@@ -186,6 +220,7 @@ export class HyperframesSlideshow extends HTMLElement {
   private presenterPositionTimers: ReturnType<typeof setTimeout>[] = [];
   private disconnected = false;
   private initTimer: ReturnType<typeof setTimeout> | null = null;
+  private initRetry: (() => void) | null = null;
   private initInFlight = false;
   private initGeneration = 0;
   private keyForwardFrame: HTMLIFrameElement | null = null;
@@ -202,6 +237,10 @@ export class HyperframesSlideshow extends HTMLElement {
   // Bumped whenever autoplay starts or media is stopped (slide change), so a
   // pending re-assert from a previous autoplay can't replay a clip we've left.
   private autoplayToken = 0;
+  private readonly ownedMedia = new OwnedMediaRegistry<PresenterMediaAction>(
+    SLIDESHOW_MEDIA_ACTIONS,
+    (el, key, action) => this.publishMediaState(el, key, action),
+  );
 
   /** Whether audio is currently muted. Reflects `data-hf-muted` attribute. */
   get muted(): boolean {
@@ -270,6 +309,10 @@ export class HyperframesSlideshow extends HTMLElement {
       clearTimeout(this.initTimer);
       this.initTimer = null;
     }
+    if (this.initRetry !== null) {
+      document.removeEventListener("DOMContentLoaded", this.initRetry);
+      this.initRetry = null;
+    }
     window.removeEventListener("keydown", this.onKey);
     this.detachIframeKeys?.();
     this.removeEventListener("touchstart", this.onTouchStart);
@@ -291,6 +334,7 @@ export class HyperframesSlideshow extends HTMLElement {
       this.playerObserver.disconnect();
       this.playerObserver = null;
     }
+    this.ownedMedia.clear();
     this.audienceMediaUnlockButton?.remove();
     this.audienceMediaUnlockButton = null;
     this.audienceMutedPlaybackKeys.clear();
@@ -395,18 +439,14 @@ export class HyperframesSlideshow extends HTMLElement {
     const gen = this.initGeneration;
 
     try {
-      const playerEl = this.querySelector("hyperframes-player");
-      if (!playerEl || !(playerEl instanceof HTMLElement)) return;
-
-      const html = this.innerHTML;
-      let manifest: ReturnType<typeof parseSlideshowManifest>;
-      try {
-        manifest = parseSlideshowManifest(html);
-      } catch {
-        // Malformed island (e.g. bad JSON) — fail gracefully, no chrome.
+      const parts = locateSlideshowParts(this);
+      if (parts.kind === "incomplete") {
+        // Missing or malformed: either an authoring error (no chrome, fail
+        // gracefully) or the parser has not finished appending our children.
+        this.retryInitWhenParsed(gen);
         return;
       }
-      if (!manifest) return;
+      const { player: playerEl, manifest } = parts;
 
       this.renderInitialChrome(manifest);
 
@@ -480,6 +520,25 @@ export class HyperframesSlideshow extends HTMLElement {
     }
   }
 
+  /**
+   * The macrotask in connectedCallback usually lets the parser append this
+   * element's children before init runs, but with the bundle loaded from
+   * <head> the timer can still fire while the parser is inside the element
+   * (seen in headless Chromium), so init finds no player, or an island that is
+   * only half streamed in, and would give up for good. While the document is
+   * still loading, retry once at DOMContentLoaded: every parser-inserted child
+   * exists by then. Once parsing is over there is nothing to wait for.
+   */
+  private retryInitWhenParsed(gen: number): void {
+    if (this.initRetry !== null || !childrenMayStillArrive(document.readyState)) return;
+    const retry = () => {
+      this.initRetry = null;
+      if (gen === this.initGeneration && this.isConnected && !this.disconnected) void this.init();
+    };
+    this.initRetry = retry;
+    document.addEventListener("DOMContentLoaded", retry, { once: true });
+  }
+
   private renderInitialChrome(manifest: SlideshowManifest): void {
     if (this.controller || manifest.slides.length === 0) return;
     const counter = { index: 1, total: manifest.slides.length };
@@ -545,8 +604,8 @@ export class HyperframesSlideshow extends HTMLElement {
     this.wireSlideshowMedia();
     if (this.mediaWireInterval === null) {
       // Same-origin player iframes can hydrate media after the slideshow binds.
-      // The dataset guard prevents duplicate listeners, and removed iframe nodes
-      // are collectable because this component keeps no media element references.
+      // The owned registry prevents duplicate listeners and releases removed
+      // iframe nodes through AbortController-backed teardown.
       this.mediaWireInterval = setInterval(() => this.wireSlideshowMedia(), 1000);
     }
   }
@@ -668,22 +727,9 @@ export class HyperframesSlideshow extends HTMLElement {
   }
 
   private wireSlideshowMedia(): void {
-    const actions: PresenterMediaAction[] = [
-      "play",
-      "pause",
-      "seeking",
-      "seeked",
-      "ratechange",
-      "volumechange",
-      "ended",
-      "timeupdate",
-    ];
-    for (const { key, el } of this.mediaEntries()) {
-      if (el.dataset.hfSlideshowMediaSync === "1") continue;
-      el.dataset.hfSlideshowMediaSync = "1";
-      for (const action of actions) {
-        el.addEventListener(action, () => this.publishMediaState(el, key, action));
-      }
+    const added = this.ownedMedia.sync(this.mediaEntries());
+    for (const el of added) {
+      el.muted = this._muted || el.defaultMuted;
     }
   }
 
@@ -868,6 +914,7 @@ export class HyperframesSlideshow extends HTMLElement {
 
   // fallow-ignore-next-line complexity
   private onMessage = (e: MessageEvent): void => {
+    if (e.source !== window.parent && e.source !== window) return;
     // Audience mode is driven by BroadcastChannel; ignore embed postMessage nav.
     if (this.resolveMode() === "audience") return;
     const data = e.data as { type?: unknown; slideIndex?: unknown } | null;
@@ -1161,20 +1208,16 @@ export class HyperframesSlideshow extends HTMLElement {
       }
     }
 
-    const doc = this.ownerDocument;
-    for (const el of doc.querySelectorAll("video, audio")) {
-      if (el instanceof HTMLMediaElement) el.muted = muted || el.defaultMuted;
-    }
+    this.ownedMedia.sync(this.mediaEntries());
+    this.ownedMedia.setMuted(muted);
   }
 
   private stopDocumentMedia(): void {
     // Invalidate any in-flight autoplay re-assert so leaving a slide can't be
     // undone by a pending timeout replaying the clip we just paused.
     this.autoplayToken++;
-    const doc = this.ownerDocument;
-    for (const el of doc.querySelectorAll("video, audio")) {
-      if (el instanceof HTMLMediaElement) el.pause();
-    }
+    this.ownedMedia.sync(this.mediaEntries());
+    this.ownedMedia.pauseAll();
   }
 
   /**

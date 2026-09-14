@@ -1,11 +1,15 @@
 // Shared types, regex constants, and utility functions used across lint rule modules.
 // Nothing in this file should emit findings — it only parses and extracts.
 
+import { Parser } from "htmlparser2";
+
 export type OpenTag = {
   raw: string;
   name: string;
   attrs: string;
   index: number;
+  closeIndex?: number;
+  endIndex?: number;
 };
 
 export type ExtractedBlock = {
@@ -15,9 +19,6 @@ export type ExtractedBlock = {
   index: number;
 };
 
-const TAG_PATTERN = /<([a-z][\w:-]*)(\s[^<>]*?)?>/gi;
-export const STYLE_BLOCK_PATTERN = /<style\b([^>]*)>([\s\S]*?)<\/style>/gi;
-export const SCRIPT_BLOCK_PATTERN = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
 const COMPOSITION_ID_IN_CSS_PATTERN = /\[data-composition-id=["']([^"']+)["']\]/g;
 export const TIMELINE_REGISTRY_INIT_PATTERN =
   /window\.__timelines\s*=\s*window\.__timelines\s*\|\|\s*\{\}|window\.__timelines\s*=\s*\{\}|window\.__timelines\s*\?\?=\s*\{\}/i;
@@ -33,9 +34,8 @@ export const TIMELINE_REGISTRY_ASSIGN_PATTERN =
 // missed `window.__timelines[spec.id] = tl`, a pattern the shipped
 // code-particle-assemble/code-3d-extrude registry blocks actually use,
 // making gsap_timeline_not_registered false-fire on correctly registered
-// timelines. The computed-key alternative is deliberately non-capturing:
-// its text isn't a literal composition id, so callers reading group 1/2
-// (readRegisteredTimelineCompositionId) must keep falling back to null for it.
+// timelines. The computed-key alternative is non-capturing; remaining
+// callers only `.test()` this pattern.
 export const WINDOW_TIMELINE_ASSIGN_PATTERN =
   /window\.__timelines(?:\[\s*(?:["']([^"']+)["']|[A-Za-z_$][\w$.]*)\s*\]|\.\s*([A-Za-z_$][\w$]*))\s*=\s*([A-Za-z_$][\w$]*)/i;
 export const INVALID_SCRIPT_CLOSE_PATTERN = /<script[^>]*>[\s\S]*?<\s*\/\s*script(?!>)/i;
@@ -45,42 +45,67 @@ const TIMELINE_REGISTRY_KEY_PATTERN =
 
 // The `window.__timelines = { ... }` object-literal body (group 1), captured so its
 // `key: value` entries can be scanned for registered keys.
-const TIMELINE_REGISTRY_OBJECT_BODY_PATTERN = /window\.__timelines\s*=\s*\{([\s\S]*?)\}/i;
+// Locates the START of a `window.__timelines = { ... }` literal. Deliberately does
+// not try to match the closing brace: see readTimelineRegistryObjectBody, which walks
+// braces instead. A regex cannot tell the registry's own `}` from the `}` of an
+// inlined options object.
+const TIMELINE_REGISTRY_OBJECT_OPEN_PATTERN = /window\.__timelines\s*=\s*\{/i;
 // A single object-literal entry whose value is an identifier (real timeline registration),
 // e.g. `main: tl` or `"comp-1": tl`. Captures the key in group 1 (quoted) or 2 (bare).
 const TIMELINE_REGISTRY_OBJECT_ENTRY_PATTERN =
   /(?:["']([^"']+)["']|([A-Za-z_$][\w$]*))\s*:\s*[A-Za-z_$][\w$]*/g;
 
-export function extractOpenTags(source: string): OpenTag[] {
+export function parseHtmlStructure(source: string): {
+  tags: OpenTag[];
+  scripts: ExtractedBlock[];
+  styles: ExtractedBlock[];
+} {
   const tags: OpenTag[] = [];
-  let match: RegExpExecArray | null;
-  const pattern = new RegExp(TAG_PATTERN.source, TAG_PATTERN.flags);
-  while ((match = pattern.exec(source)) !== null) {
-    const raw = match[0];
-    if (raw.startsWith("</") || raw.startsWith("<!")) continue;
-    tags.push({
-      raw,
-      name: (match[1] || "").toLowerCase(),
-      attrs: match[2] || "",
-      index: match.index,
-    });
-  }
-  return tags;
-}
+  const blocks = { script: [] as ExtractedBlock[], style: [] as ExtractedBlock[] };
+  const openTagsByName = new Map<string, OpenTag[]>();
+  const openBlocks: Array<{
+    name: "script" | "style";
+    attrs: string;
+    contentStart: number;
+    index: number;
+  }> = [];
+  const parser: Parser = new Parser(
+    {
+      onopentag(name) {
+        const index = parser.startIndex;
+        const raw = source.slice(index, parser.endIndex + 1);
+        const attrs = raw.slice(name.length + 1, -1).replace(/\s*\/$/, "");
+        const tag = { raw, name, attrs, index };
+        tags.push(tag);
+        const sameNameStack = openTagsByName.get(name) ?? [];
+        sameNameStack.push(tag);
+        openTagsByName.set(name, sameNameStack);
+        if (name === "script" || name === "style") {
+          openBlocks.push({ name, attrs, contentStart: parser.endIndex + 1, index });
+        }
+      },
+      onclosetag(name) {
+        const tag = openTagsByName.get(name)?.pop();
+        if (tag) {
+          tag.closeIndex = parser.startIndex;
+          tag.endIndex = parser.endIndex + 1;
+        }
+        if (name !== "script" && name !== "style") return;
+        const block = openBlocks.pop();
+        if (!block || block.name !== name) return;
+        blocks[name].push({
+          attrs: block.attrs,
+          content: source.slice(block.contentStart, parser.startIndex),
+          raw: source.slice(block.index, parser.endIndex + 1),
+          index: block.index,
+        });
+      },
+    },
+    { decodeEntities: false, lowerCaseAttributeNames: false, lowerCaseTags: true },
+  );
+  parser.end(source);
 
-export function extractBlocks(source: string, pattern: RegExp): ExtractedBlock[] {
-  const blocks: ExtractedBlock[] = [];
-  let match: RegExpExecArray | null;
-  const p = new RegExp(pattern.source, pattern.flags);
-  while ((match = p.exec(source)) !== null) {
-    blocks.push({
-      attrs: match[1] || "",
-      content: match[2] || "",
-      raw: match[0],
-      index: match.index,
-    });
-  }
-  return blocks;
+  return { tags, scripts: blocks.script, styles: blocks.style };
 }
 
 /**
@@ -89,41 +114,25 @@ export function extractBlocks(source: string, pattern: RegExp): ExtractedBlock[]
  * composition's visible root", whereas `<html>` is where document-level
  * metadata like `data-composition-variables` lives.
  */
-export function findHtmlTag(source: string): OpenTag | null {
-  const match = /<html\b([^<>]*)>/i.exec(source);
-  if (!match) return null;
-  return {
-    raw: match[0],
-    name: "html",
-    attrs: match[1] ?? "",
-    index: match.index,
-  };
+export function findHtmlTag(tags: readonly OpenTag[]): OpenTag | null {
+  return tags.find((tag) => tag.name === "html") ?? null;
 }
 
 // fallow-ignore-next-line complexity
-export function findRootTag(source: string): OpenTag | null {
-  const bodyOpenMatch = /<body\b([^>]*)>/i.exec(source);
-  const bodyCloseMatch = /<\/body>/i.exec(source);
+export function findRootTag(source: string, parsedTags?: readonly OpenTag[]): OpenTag | null {
+  const tags = parsedTags ?? parseHtmlStructure(source).tags;
+  const bodyTag = tags.find((tag) => tag.name === "body");
   if (
-    bodyOpenMatch &&
-    (readAttr(bodyOpenMatch[0], "data-composition-id") ||
-      readAttr(bodyOpenMatch[0], "data-width") ||
-      readAttr(bodyOpenMatch[0], "data-height"))
+    bodyTag &&
+    (readDecodedAttr(bodyTag.raw, "data-composition-id") ||
+      readAttr(bodyTag.raw, "data-width") ||
+      readAttr(bodyTag.raw, "data-height"))
   ) {
-    return {
-      raw: bodyOpenMatch[0],
-      name: "body",
-      attrs: bodyOpenMatch[1] ?? "",
-      index: bodyOpenMatch.index,
-    };
+    return bodyTag;
   }
-  const bodyStart = bodyOpenMatch ? bodyOpenMatch.index + bodyOpenMatch[0].length : 0;
-  const bodyEnd =
-    bodyOpenMatch && bodyCloseMatch && bodyCloseMatch.index > bodyStart
-      ? bodyCloseMatch.index
-      : source.length;
-  const bodyContent = bodyOpenMatch ? source.slice(bodyStart, bodyEnd) : source;
-  const bodyTags = extractOpenTags(bodyContent);
+  const bodyStart = bodyTag ? bodyTag.index + bodyTag.raw.length : 0;
+  const bodyEnd = bodyTag?.closeIndex ?? source.length;
+  const bodyTags = tags.filter((tag) => tag.index >= bodyStart && tag.index < bodyEnd);
   // Set when a leading <svg> defs block is skipped (see below) — extractOpenTags
   // is a flat, nesting-unaware scan, so without this the very next tag it
   // returns is the svg's own nested child (<defs>, <filter>, ...), not the
@@ -142,19 +151,46 @@ export function findRootTag(source: string): OpenTag | null {
     // still eligible as the root.
     if (
       tag.name === "svg" &&
-      !readAttr(tag.raw, "data-composition-id") &&
+      !readDecodedAttr(tag.raw, "data-composition-id") &&
       !readAttr(tag.raw, "data-width") &&
       !readAttr(tag.raw, "data-height")
     ) {
-      const closeMatch = /<\/svg\s*>/i.exec(bodyContent.slice(tag.index));
       // No closing tag found (malformed HTML) — skip everything rather than
       // risk returning one of the svg's own children as the root.
-      skipBefore = closeMatch ? tag.index + closeMatch.index + closeMatch[0].length : Infinity;
+      skipBefore = tag.endIndex ?? Infinity;
       continue;
     }
-    return { ...tag, index: tag.index + bodyStart };
+    return tag;
   }
   return null;
+}
+
+/**
+ * Whether a tag's attribute text contains a `<` outside any quoted value.
+ *
+ * A legitimate attribute value may itself contain a raw `<` (e.g.
+ * `data-expr="x < y"`) — that's fine, htmlparser2 (and browsers) parse it as
+ * ordinary attribute text. But a `<` OUTSIDE any quotes means a following
+ * start tag never got its own `<`: the HTML tokenizer swallowed it as bogus
+ * attribute-name text on the tag currently open, and the intended element
+ * never becomes a real node. `<img src="a.png" <div class="hl">` is exactly
+ * this: `attrs` comes back as ` src="a.png" <div class="hl"` and the `.hl`
+ * div silently never renders.
+ */
+export function hasUnquotedLessThan(attrs: string): boolean {
+  let quote: '"' | "'" | null = null;
+  for (const ch of attrs) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === "<") {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function readAttr(tagSource: string, attr: string): string | null {
@@ -168,34 +204,36 @@ export function readAttr(tagSource: string, attr: string): string | null {
   return match?.[1] || null;
 }
 
+/** Read an HTML attribute using browser-equivalent character-reference decoding. */
+export function readDecodedAttr(tagSource: string, attr: string): string | null {
+  if (!tagSource) return null;
+  let value: string | null = null;
+  const parser = new Parser(
+    {
+      onattribute(name, decodedValue) {
+        if (value === null && name.toLowerCase() === attr.toLowerCase()) value = decodedValue;
+      },
+    },
+    { decodeEntities: true, lowerCaseAttributeNames: false, lowerCaseTags: true },
+  );
+  parser.end(tagSource);
+  return value;
+}
+
 /**
- * Read an attribute that may legitimately contain the opposite quote
- * character. `readAttr` truncates `data-variable-values='{"title":"Hello"}'`
- * at the first internal `"` because its `[^"']+` class excludes both quote
- * types. This variant alternates: a double-quoted value never contains an
- * unescaped `"`, and a single-quoted value never contains an unescaped `'`,
- * so each branch can use a quote-specific class.
- *
- * Use for attributes whose values are JSON or otherwise carry the opposite
- * quote character. Existing single-token attributes (`id`, `class`, etc.)
- * stick with `readAttr` for consistency with the rest of the lint code.
+ * Read a JSON-bearing attribute with browser-equivalent character-reference
+ * decoding. Imported or formatter-serialized HTML commonly stores JSON quotes
+ * as `&quot;`; lint must inspect the same decoded value that `getAttribute()`
+ * exposes at runtime.
  */
 export function readJsonAttr(tagSource: string, attr: string): string | null {
-  if (!tagSource) return null;
-  const escaped = attr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  // See readAttr: `(?<![\w-])` prevents a short name from matching the tail of a
-  // longer hyphenated attribute (e.g. "id" inside `data-hf-id`).
-  const match = tagSource.match(
-    new RegExp(`(?<![\\w-])${escaped}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"),
-  );
-  if (!match) return null;
-  return match[1] ?? match[2] ?? null;
+  return readDecodedAttr(tagSource, attr);
 }
 
 export function collectCompositionIds(tags: OpenTag[]): Set<string> {
   const ids = new Set<string>();
   for (const tag of tags) {
-    const compId = readAttr(tag.raw, "data-composition-id");
+    const compId = readDecodedAttr(tag.raw, "data-composition-id");
     if (compId) ids.add(compId);
   }
   return ids;
@@ -225,18 +263,69 @@ export function extractTimelineRegistryKeys(source: string): string[] {
     const key = match[1] ?? match[2];
     if (key) keys.add(key);
   }
-  const objectBody = TIMELINE_REGISTRY_OBJECT_BODY_PATTERN.exec(source)?.[1];
-  if (objectBody) {
-    const entryPattern = new RegExp(
-      TIMELINE_REGISTRY_OBJECT_ENTRY_PATTERN.source,
-      TIMELINE_REGISTRY_OBJECT_ENTRY_PATTERN.flags,
-    );
-    while ((match = entryPattern.exec(objectBody)) !== null) {
-      const key = match[1] ?? match[2];
-      if (key) keys.add(key);
-    }
-  }
+  for (const entry of readTimelineRegistryTopLevelKeys(source)) keys.add(entry);
   return [...keys];
+}
+
+/**
+ * Top-level keys of a `window.__timelines = { ... }` literal.
+ *
+ * Walks brace depth rather than regex-matching the body. The previous non-greedy
+ * body match stopped at the first `}` it saw, which for the legal one-liner
+ *
+ *   window.__timelines = { main: gsap.timeline({ paused: true }) };
+ *
+ * was the brace of the INLINED OPTIONS OBJECT. The entry scanner then harvested
+ * `paused` as a composition id and timeline_id_mismatch reported a timeline
+ * "registered as paused" — a registration that does not exist, so its fixHint
+ * could never be applied. Hoisting the timeline to a variable was the only escape,
+ * and nothing said so.
+ */
+/** Index of the brace that closes the group opened just before `bodyStart`. */
+function findMatchingBrace(source: string, bodyStart: number): number {
+  let depth = 1;
+  for (let i = bodyStart; i < source.length; i += 1) {
+    if (source[i] === "{") depth += 1;
+    else if (source[i] === "}" && (depth -= 1) === 0) return i;
+  }
+  return source.length;
+}
+
+/** Replace every nested brace group with spaces so only depth-0 text remains. */
+function blankNestedBraceGroups(body: string): string {
+  let out = "";
+  let depth = 0;
+  for (const ch of body) {
+    if (ch === "{") depth += 1;
+    else if (ch === "}") depth = Math.max(0, depth - 1);
+    else if (depth === 0) {
+      out += ch;
+      continue;
+    }
+    out += " ";
+  }
+  return out;
+}
+
+function readTimelineRegistryTopLevelKeys(source: string): string[] {
+  const open = TIMELINE_REGISTRY_OBJECT_OPEN_PATTERN.exec(source);
+  if (!open) return [];
+
+  const bodyStart = open.index + open[0].length;
+  const body = source.slice(bodyStart, findMatchingBrace(source, bodyStart));
+  const flattened = blankNestedBraceGroups(body);
+
+  const keys: string[] = [];
+  const entryPattern = new RegExp(
+    TIMELINE_REGISTRY_OBJECT_ENTRY_PATTERN.source,
+    TIMELINE_REGISTRY_OBJECT_ENTRY_PATTERN.flags,
+  );
+  let entry: RegExpExecArray | null;
+  while ((entry = entryPattern.exec(flattened)) !== null) {
+    const key = entry[1] ?? entry[2];
+    if (key) keys.push(key);
+  }
+  return keys;
 }
 
 export function getInlineScriptSyntaxError(source: string): string | null {
@@ -252,24 +341,89 @@ export function getInlineScriptSyntaxError(source: string): string | null {
 }
 
 // fallow-ignore-next-line complexity
-export function stripJsComments(source: string): string {
+/**
+ * Blank the contents of every `'...'` and `"..."` literal, keeping the quotes so
+ * the source stays the same shape.
+ *
+ * Needed because a composition that *displays* source code carries things like
+ * `Math.random()` inside a string it never executes. Scanning raw script text for
+ * non-determinism reported those compositions as non-deterministic, and no edit
+ * could clear it while keeping the displayed snippet intact.
+ *
+ * Template literals are deliberately left alone: `${Math.random()}` inside one IS
+ * executed, and blanking it would hide real non-determinism. A snippet stored in a
+ * backtick string therefore still reports — a narrower gap than the one this closes.
+ */
+export function stripStringLiterals(source: string): string {
+  return source.replace(
+    /(['"])(?:\\.|(?!\1)[^\\\n])*\1?/g,
+    (literal) => literal[0] + " ".repeat(Math.max(0, literal.length - 1)),
+  );
+}
+
+// fallow-ignore-next-line complexity
+function scanJsComments(source: string): { out: string; balanced: boolean } {
   let out = "";
   let i = 0;
   let quote: "'" | '"' | "`" | null = null;
   let escaped = false;
+  let inRegex = false;
+  let inRegexClass = false;
+  let regexMisread = false;
+  const ctx = new CodeContext();
+
+  const emitCode = (ch: string) => {
+    out += ch;
+    ctx.push(ch);
+  };
+  const emitOpaque = (ch: string) => {
+    out += ch;
+    ctx.push(" ");
+  };
 
   while (i < source.length) {
     const ch = source[i] ?? "";
     const next = source[i + 1] ?? "";
 
-    if (quote) {
+    if (inRegex) {
       out += ch;
       if (escaped) {
         escaped = false;
+        if (ch === "\n" || ch === "\r") {
+          inRegex = false;
+          inRegexClass = false;
+          regexMisread = true;
+        }
       } else if (ch === "\\") {
         escaped = true;
+      } else if (ch === "[") {
+        inRegexClass = true;
+      } else if (ch === "]") {
+        inRegexClass = false;
+      } else if (ch === "/" && !inRegexClass) {
+        inRegex = false;
+        ctx.push(ch);
+      } else if (ch === "\n" || ch === "\r") {
+        inRegex = false;
+        inRegexClass = false;
+        regexMisread = true;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+        emitOpaque(ch);
+      } else if (ch === "\\") {
+        escaped = true;
+        emitOpaque(ch);
       } else if (ch === quote) {
         quote = null;
+        emitCode(ch);
+      } else {
+        emitOpaque(ch);
       }
       i += 1;
       continue;
@@ -277,16 +431,19 @@ export function stripJsComments(source: string): string {
 
     if (ch === "'" || ch === '"' || ch === "`") {
       quote = ch;
-      out += ch;
+      emitCode(ch);
       i += 1;
       continue;
     }
 
     if (ch === "/" && next === "/") {
       out += "  ";
+      ctx.push(" ");
+      ctx.push(" ");
       i += 2;
       while (i < source.length && source[i] !== "\n" && source[i] !== "\r") {
         out += " ";
+        ctx.push(" ");
         i += 1;
       }
       continue;
@@ -294,21 +451,272 @@ export function stripJsComments(source: string): string {
 
     if (ch === "/" && next === "*") {
       out += "  ";
+      ctx.push(" ");
+      ctx.push(" ");
       i += 2;
       while (i < source.length) {
         const blockCh = source[i] ?? "";
         const blockNext = source[i + 1] ?? "";
         if (blockCh === "*" && blockNext === "/") {
           out += "  ";
+          ctx.push(" ");
+          ctx.push(" ");
           i += 2;
           break;
         }
-        out += blockCh === "\n" || blockCh === "\r" ? blockCh : " ";
+        const kept = blockCh === "\n" || blockCh === "\r" ? blockCh : " ";
+        out += kept;
+        ctx.push(kept);
         i += 1;
       }
       continue;
     }
 
+    if (ch === "/" && ctx.startsRegexLiteral()) {
+      inRegex = true;
+      emitCode(ch);
+      i += 1;
+      continue;
+    }
+
+    emitCode(ch);
+    i += 1;
+  }
+
+  return { out, balanced: quote === null && !inRegex && !regexMisread };
+}
+
+export function stripJsComments(source: string): string {
+  return scanJsComments(source).out;
+}
+
+export function stripJsCode(source: string): string {
+  const { out, balanced } = scanJsComments(source);
+  return balanced ? stripJsStringLiterals(out) : source;
+}
+
+const REGEX_ALLOWED_BEFORE = new Set("=(,:[!&|?{};+-*%^~<>");
+const REGEX_ALLOWED_KEYWORDS = new Set([
+  "return",
+  "typeof",
+  "instanceof",
+  "in",
+  "of",
+  "new",
+  "delete",
+  "void",
+  "case",
+  "do",
+  "else",
+  "yield",
+  "await",
+]);
+
+const WORD_CHAR = /[A-Za-z0-9_$]/;
+
+/**
+ * Tracks just enough emitted context to tell a regex literal from a division: the last
+ * two significant characters and the trailing identifier. Carried incrementally because
+ * re-scanning the accumulated output per candidate slash is quadratic — a composition
+ * with one inlined vendor bundle took 58x longer to lint.
+ */
+class CodeContext {
+  private last = "";
+  private prev = "";
+  private word = "";
+  private wordEnded = false;
+  private wordAfterDot = false;
+
+  push(ch: string): void {
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+      this.wordEnded = true;
+      return;
+    }
+    if (WORD_CHAR.test(ch)) {
+      if (this.wordEnded || this.word === "") this.wordAfterDot = this.last === ".";
+      this.word = this.wordEnded ? ch : this.word + ch;
+    } else {
+      this.word = "";
+      this.wordAfterDot = false;
+    }
+    this.wordEnded = false;
+    this.prev = this.last;
+    this.last = ch;
+  }
+
+  startsRegexLiteral(): boolean {
+    if (this.last === "") return true;
+    if (WORD_CHAR.test(this.last))
+      return !this.wordAfterDot && REGEX_ALLOWED_KEYWORDS.has(this.word);
+    if ((this.last === "+" || this.last === "-") && this.prev === this.last) return false;
+    return REGEX_ALLOWED_BEFORE.has(this.last);
+  }
+}
+
+/**
+ * Blanks string, template-literal and regex-literal *contents* (delimiters, length
+ * and newline positions kept) so a rule scanning for an API call does not match one
+ * a composition merely renders as on-screen text. Template `${…}` expressions stay —
+ * they are code. Returns the source untouched if the scan ends mid-literal, so a
+ * parse this scanner cannot model degrades to the caller's pre-existing behaviour
+ * rather than silently blanking real code on an `error`-severity gate.
+ */
+// fallow-ignore-next-line complexity
+export function stripJsStringLiterals(source: string): string {
+  let out = "";
+  let i = 0;
+  const templateBraces: number[] = [];
+  const ctx = new CodeContext();
+  let quote: "'" | '"' | "`" | null = null;
+  let escaped = false;
+  let inRegex = false;
+  let inRegexClass = false;
+  let regexMisread = false;
+
+  const blank = (ch: string) => (ch === "\n" || ch === "\r" ? ch : " ");
+  const emit = (text: string) => {
+    out += text;
+    for (const ch of text) ctx.push(ch);
+  };
+
+  while (i < source.length) {
+    const ch = source[i] ?? "";
+    const next = source[i + 1] ?? "";
+
+    if (inRegex) {
+      if (escaped) {
+        escaped = false;
+        if (ch === "\n" || ch === "\r") {
+          inRegex = false;
+          inRegexClass = false;
+          regexMisread = true;
+        }
+        emit(blank(ch));
+      } else if (ch === "\\") {
+        escaped = true;
+        emit(" ");
+      } else if (ch === "[") {
+        inRegexClass = true;
+        emit(" ");
+      } else if (ch === "]") {
+        inRegexClass = false;
+        emit(" ");
+      } else if (ch === "/" && !inRegexClass) {
+        inRegex = false;
+        emit(ch);
+      } else if (ch === "\n" || ch === "\r") {
+        inRegex = false;
+        inRegexClass = false;
+        escaped = false;
+        regexMisread = true;
+        emit(ch);
+      } else {
+        emit(" ");
+      }
+      i += 1;
+      continue;
+    }
+
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+        emit(blank(ch));
+      } else if (ch === "\\") {
+        escaped = true;
+        emit(" ");
+      } else if (ch === quote) {
+        quote = null;
+        emit(ch);
+      } else if (ch === "`" || quote !== "`" || ch !== "$" || next !== "{") {
+        emit(blank(ch));
+      } else {
+        templateBraces.push(0);
+        quote = null;
+        emit("${");
+        i += 2;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      emit(ch);
+      i += 1;
+      continue;
+    }
+
+    if (ch === "/" && next !== "/" && next !== "*" && ctx.startsRegexLiteral()) {
+      inRegex = true;
+      emit(ch);
+      i += 1;
+      continue;
+    }
+
+    if (templateBraces.length > 0) {
+      const depth = templateBraces[templateBraces.length - 1] ?? 0;
+      if (ch === "{") templateBraces[templateBraces.length - 1] = depth + 1;
+      else if (ch === "}") {
+        if (depth === 0) {
+          templateBraces.pop();
+          quote = "`";
+          emit(ch);
+          i += 1;
+          continue;
+        }
+        templateBraces[templateBraces.length - 1] = depth - 1;
+      }
+    }
+
+    emit(ch);
+    i += 1;
+  }
+
+  if (quote !== null || templateBraces.length > 0 || inRegex || regexMisread) return source;
+  return out;
+}
+
+/**
+ * Drops CSS comments without following a `/*` that only appears inside a string —
+ * a slide printing comment markers as content otherwise pairs two of them and
+ * deletes the real rules in between.
+ */
+// fallow-ignore-next-line complexity
+export function stripCssComments(source: string): string {
+  let out = "";
+  let i = 0;
+  let quote: "'" | '"' | null = null;
+
+  while (i < source.length) {
+    const ch = source[i] ?? "";
+    if (quote) {
+      out += ch;
+      if (ch === "\\") {
+        out += source[i + 1] ?? "";
+        i += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && source[i + 1] === "*") {
+      const end = source.indexOf("*/", i + 2);
+      const stop = end === -1 ? source.length : end + 2;
+      for (let j = i; j < stop; j += 1) {
+        const c = source[j] ?? "";
+        out += c === "\n" || c === "\r" ? c : " ";
+      }
+      i = stop;
+      continue;
+    }
     out += ch;
     i += 1;
   }
@@ -371,4 +779,18 @@ export function truncateSnippet(value: string, maxLength = 220): string | undefi
   if (!normalized) return undefined;
   if (normalized.length <= maxLength) return normalized;
   return `${normalized.slice(0, maxLength - 3)}...`;
+}
+
+/**
+ * Matches a media tag carrying a real `src` attribute, capturing the tag name in
+ * group 1 and the src value in group 2.
+ *
+ * The leading whitespace before `src` is load-bearing: `\bsrc\s*=` also matches
+ * the tail of `data-var-src="bg"` (a hyphen/`s` boundary is a word boundary), and
+ * since `[^>]*` is greedy it wins over a real `src` earlier in the same tag. Every
+ * element using a variable binding was therefore reported as referencing a missing
+ * file named after the variable id.
+ */
+export function mediaSrcTagRe(tagAlternation: string): RegExp {
+  return new RegExp(`<(${tagAlternation})\\b[^>]*\\ssrc\\s*=\\s*["']([^"']+)["'][^>]*>`, "gi");
 }

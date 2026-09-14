@@ -82,6 +82,52 @@ describe("buildRenderPerfSummary static-dedup aggregation", () => {
     });
   });
 
+  it("keeps predicted and verified counts distinct and aggregates bounded verifier telemetry", () => {
+    const s = buildRenderPerfSummary(
+      baseInput([
+        perf({
+          staticDedupEnabled: true,
+          staticDedupArmed: true,
+          staticDedupPredicted: 300,
+          staticDedupVerified: 240,
+          staticDedupVerificationOutcome: "time_budget",
+          staticDedupVerificationPlannedRuns: 60,
+          staticDedupVerificationCompletedRuns: 48,
+          staticDedupVerificationScreenshots: 96,
+          staticDedupVerificationSeeks: 97,
+          staticDedupVerificationComparisons: 48,
+          staticDedupVerificationElapsedMs: 15_000,
+        }),
+        perf({
+          staticDedupEnabled: true,
+          staticDedupArmed: true,
+          staticDedupPredicted: 200,
+          staticDedupVerified: 200,
+          staticDedupVerificationOutcome: "verified",
+          staticDedupVerificationPlannedRuns: 40,
+          staticDedupVerificationCompletedRuns: 40,
+          staticDedupVerificationScreenshots: 80,
+          staticDedupVerificationSeeks: 81,
+          staticDedupVerificationComparisons: 40,
+          staticDedupVerificationElapsedMs: 8_000,
+        }),
+      ]),
+    ).staticDedup;
+    expect(s).toMatchObject({
+      armed: true,
+      predictedFrames: 500,
+      verifiedFrames: 440,
+      verificationOutcomes: ["time_budget", "verified"],
+      plannedRuns: 100,
+      completedRuns: 88,
+      screenshots: 176,
+      seeks: 178,
+      comparisons: 88,
+      verificationElapsedMs: 23_000,
+      skipReason: undefined,
+    });
+  });
+
   it("reports skipReason when no worker armed", () => {
     const s = buildRenderPerfSummary(
       baseInput([
@@ -160,5 +206,36 @@ describe("buildRenderPerfSummary capture average attribution", () => {
     );
 
     expect(summary.captureAvgMs).toBe(43);
+  });
+});
+
+describe("buildRenderPerfSummary beginframe no-damage reuse aggregation", () => {
+  it("is undefined when no capture session ran", () => {
+    expect(buildRenderPerfSummary(baseInput([])).beginFrameReuse).toBeUndefined();
+  });
+
+  it("is undefined when no session captured in beginframe mode (both counters zero)", () => {
+    const s = buildRenderPerfSummary(
+      baseInput([perf({ staticDedupEnabled: true, staticDedupReused: 10 })]),
+    ).beginFrameReuse;
+    expect(s).toBeUndefined();
+  });
+
+  it("SUMs no-damage and has-damage frames across workers", () => {
+    const s = buildRenderPerfSummary(
+      baseInput([
+        perf({ beginFrameNoDamage: 240, beginFrameHasDamage: 160 }),
+        perf({ beginFrameNoDamage: 245, beginFrameHasDamage: 155 }),
+        perf({ beginFrameNoDamage: 235, beginFrameHasDamage: 165 }),
+      ]),
+    ).beginFrameReuse;
+    expect(s).toEqual({ noDamageFrames: 720, hasDamageFrames: 480 });
+  });
+
+  it("reports an all-damage beginframe render (noDamageFrames 0, not undefined)", () => {
+    const s = buildRenderPerfSummary(
+      baseInput([perf({ beginFrameNoDamage: 0, beginFrameHasDamage: 400 })]),
+    ).beginFrameReuse;
+    expect(s).toEqual({ noDamageFrames: 0, hasDamageFrames: 400 });
   });
 });

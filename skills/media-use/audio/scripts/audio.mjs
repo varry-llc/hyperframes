@@ -39,7 +39,7 @@
 // the generate path it is spawned detached (bgm_pending:true) — run wait-bgm.mjs
 // before assembling.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { heygenAuthHeaders, heygenCredential, loadEnvFromDir } from "./lib/heygen.mjs";
@@ -54,6 +54,7 @@ import {
 import { generateBgmDetached, inferBgmPrompt, retrieveBgm } from "./lib/bgm.mjs";
 import { resolveSfx } from "./lib/sfx.mjs";
 import { mapWithConcurrency } from "./lib/concurrency.mjs";
+import { openAudioMeta } from "./lib/audio-meta.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
@@ -115,7 +116,8 @@ const heygenOK = heygenCredential() !== null;
 const headers = heygenOK ? heygenAuthHeaders() : null;
 
 // ── merge base: preserve sections not selected by --only ──────────────────────
-const prev = existsSync(outPath) ? JSON.parse(readFileSync(outPath, "utf8")) : {};
+const audioMeta = openAudioMeta(outPath);
+const prev = audioMeta.value;
 const anomalies = [];
 
 // ── TTS ───────────────────────────────────────────────────────────────────────
@@ -145,7 +147,7 @@ if (only.has("tts") && lines.length) {
     }
     const rel = `assets/voice/${id}.wav`;
     const abs = join(hyperframesDir, rel);
-    const { ok, words } = await synthesizeOne({
+    const { ok, words, error } = await synthesizeOne({
       provider: ttsProvider,
       text,
       voiceId,
@@ -155,7 +157,7 @@ if (only.has("tts") && lines.length) {
       hyperframesDir,
     });
     if (!ok) {
-      anomalies.push(`line ${id}: TTS failed — omitted`);
+      anomalies.push(`line ${id}: TTS failed — omitted${error ? ` (${error})` : ""}`);
       return null;
     }
     let wordArr = words; // heygen: native; else transcribe
@@ -279,7 +281,7 @@ const meta = {
   total_duration_s: totalDuration,
 };
 mkdirSync(dirname(outPath), { recursive: true });
-writeFileSync(outPath, JSON.stringify(meta, null, 2));
+audioMeta.write(meta);
 
 console.log(`✓ audio engine → ${outPath}`);
 console.log(`  heygen: ${heygenOK ? "yes" : "no"}  ·  ran: ${[...only].join(",")}`);

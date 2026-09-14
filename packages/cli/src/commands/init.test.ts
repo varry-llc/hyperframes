@@ -1,12 +1,25 @@
 import { describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { applyResolutionPreset, injectTailwindBrowserScript } from "./init.js";
+import {
+  applyResolutionPreset,
+  injectTailwindBrowserScript,
+  resolveVideoDurationSeconds,
+} from "./init.js";
 
 const cliEntry = resolve(fileURLToPath(import.meta.url), "..", "..", "cli.ts");
+const initSource = readFileSync(new URL("./init.ts", import.meta.url), "utf-8");
 const tailwindScript =
   '<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js" integrity="sha384-v5YF9xS+gLRWdvrQ0u/WRbCkjSIH0NjHIPe8tBL1ZRrmI7PiSH6LLdzs0aAIMCuh" crossorigin="anonymous"></script>';
 
@@ -29,7 +42,77 @@ function runInit(args: string[]): { status: number; stdout: string; stderr: stri
   };
 }
 
+function expectScaffoldedScripts(target: string): void {
+  const pkg = JSON.parse(readFileSync(join(target, "package.json"), "utf-8")) as {
+    scripts?: Record<string, string>;
+  };
+  expect(pkg.scripts).toMatchObject({
+    dev: "npx --yes hyperframes preview",
+    check: "npx --yes hyperframes check",
+    render: "npx --yes hyperframes render",
+    publish: "npx --yes hyperframes publish",
+  });
+  expect(Object.keys(pkg.scripts ?? {}).sort()).toEqual(["check", "dev", "publish", "render"]);
+}
+
 describe("hyperframes init flag rename", () => {
+  it("selects the language-compatible model before both eager init downloads", () => {
+    expect(initSource).toMatch(
+      /const initialTranscriptionModel = initialModelForLanguage\(\s*modelFlag \?\? DEFAULT_MODEL,\s*languageFlag,?\s*\);/,
+    );
+    expect(initSource.match(/await ensureModel\(initialTranscriptionModel/g)).toHaveLength(2);
+    expect(initSource).not.toMatch(/await ensureModel\(modelFlag/g);
+  });
+
+  it("bare init scaffolds the centered blank without --example", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
+    const target = join(dir, "proj");
+    try {
+      const res = runInit([target, "--non-interactive"]);
+      expect(res.status).toBe(0);
+      const html = readFileSync(join(target, "index.html"), "utf-8");
+      expect(html).toContain('data-composition-id="main"');
+      expect(html).toContain("display: flex");
+      expect(html).toContain("align-items: center");
+      expect(html).toContain("font-family: Inter");
+      expect(html).toContain("tl.seek(0)");
+      expect(html).not.toMatch(/transform:\s*translate\(-50%/);
+      expect(html).toMatch(/#root\s*\{[^}]*width:\s*100%/);
+      expect(html).not.toContain("window.__timelines = window.__timelines || {}");
+      expectScaffoldedScripts(target);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a following flag when --example has no value", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
+    const target = join(dir, "proj");
+    try {
+      const res = runInit([target, "--example", "--non-interactive"]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("--example requires a value");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("deprecated --agent still scaffolds the same centered blank", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
+    const target = join(dir, "proj");
+    try {
+      const res = runInit([target, "--agent"]);
+      expect(res.status).toBe(0);
+      const html = readFileSync(join(target, "index.html"), "utf-8");
+      expect(html).toContain("font-family: Inter");
+      expect(html).toContain("tl.seek(0)");
+      expectScaffoldedScripts(target);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("--example blank scaffolds a bundled project with npm scripts", () => {
     const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
     const target = join(dir, "proj");
@@ -44,18 +127,10 @@ describe("hyperframes init flag rename", () => {
       const pkg = JSON.parse(readFileSync(join(target, "package.json"), "utf-8")) as {
         private?: boolean;
         type?: string;
-        scripts?: Record<string, string>;
       };
       expect(pkg.private).toBe(true);
       expect(pkg.type).toBe("module");
-      expect(pkg.scripts).toMatchObject({
-        dev: "npx --yes hyperframes preview",
-        check:
-          "npx --yes hyperframes lint && npx --yes hyperframes validate && npx --yes hyperframes inspect",
-        render: "npx --yes hyperframes render",
-        publish: "npx --yes hyperframes publish",
-      });
-      expect(Object.keys(pkg.scripts ?? {}).sort()).toEqual(["check", "dev", "publish", "render"]);
+      expectScaffoldedScripts(target);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -79,17 +154,7 @@ describe("hyperframes init flag rename", () => {
       expect(html).toContain(tailwindScript);
       expect(html).toContain("window.__tailwindReady");
 
-      const pkg = JSON.parse(readFileSync(join(target, "package.json"), "utf-8")) as {
-        scripts?: Record<string, string>;
-      };
-      expect(pkg.scripts).toMatchObject({
-        dev: "npx --yes hyperframes preview",
-        check:
-          "npx --yes hyperframes lint && npx --yes hyperframes validate && npx --yes hyperframes inspect",
-        render: "npx --yes hyperframes render",
-        publish: "npx --yes hyperframes publish",
-      });
-      expect(Object.keys(pkg.scripts ?? {}).sort()).toEqual(["check", "dev", "publish", "render"]);
+      expectScaffoldedScripts(target);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -135,6 +200,34 @@ describe("hyperframes init flag rename", () => {
     expect(injected).not.toContain("setTimeout");
   });
 
+  it("packs from-file and wires --video into the composition", () => {
+    const copySource = readFileSync(
+      new URL("../../scripts/build-copy.mjs", import.meta.url),
+      "utf-8",
+    );
+    expect(copySource).toContain('for (const tmpl of ["blank", "from-file", "_shared"])');
+    const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
+    const target = join(dir, "proj");
+    const clip = join(dir, "clip.mp4");
+    copyFileSync(
+      resolve(
+        fileURLToPath(import.meta.url),
+        "../../../../studio/tests/e2e/fixtures/design-panel-qa/assets/test.mp4",
+      ),
+      clip,
+    );
+    try {
+      const res = runInit([target, "--non-interactive", "--skip-transcribe", "--video", clip]);
+      expect(res.status).toBe(0);
+      const html = readFileSync(join(target, "index.html"), "utf-8");
+      expect(html).toContain('id="a-roll"');
+      expect(html).toContain('src="clip.mp4"');
+      expect(existsSync(join(target, "clip.mp4"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("-v works as the short alias for --video", () => {
     const dir = mkdtempSync(join(tmpdir(), "hf-init-test-"));
     const target = join(dir, "proj");
@@ -154,6 +247,26 @@ describe("hyperframes init flag rename", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("uses the video stream duration when audio outlasts the final video frame", () => {
+    expect(
+      resolveVideoDurationSeconds({
+        streamDuration: 1,
+        frameDuration: 1,
+        formatDuration: 1.2,
+      }),
+    ).toBe(1);
+  });
+
+  it("falls through unusable stream durations before using the container duration", () => {
+    expect(
+      resolveVideoDurationSeconds({
+        streamDuration: 0,
+        frameDuration: Number.NaN,
+        formatDuration: 1.2,
+      }),
+    ).toBe(1.2);
   });
 
   it("--audio with a missing file fails without creating the project directory", () => {

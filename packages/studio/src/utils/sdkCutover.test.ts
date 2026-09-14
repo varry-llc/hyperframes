@@ -6,11 +6,14 @@ import {
   sdkTimingPersist,
   sdkGsapTweenPersist,
   sdkGsapKeyframePersist,
+  cutoverCommittedOrThrow,
+  persistSdkCandidateMutation,
+  persistSdkSerialize,
 } from "./sdkCutover";
+// fallow-ignore-file code-duplication
 import { openComposition } from "@hyperframes/sdk";
 import { createMemoryAdapter } from "@hyperframes/sdk/adapters/memory";
 import type { PatchOperation } from "./sourcePatcher";
-import type { MutableRefObject } from "react";
 
 vi.mock("../components/editor/manualEditingAvailability", () => ({
   STUDIO_SDK_CUTOVER_ENABLED: true,
@@ -42,6 +45,14 @@ const htmlAttrOp = (property: string, value: string): PatchOperation => ({
   type: "html-attribute",
   property,
   value,
+});
+
+const candidateTestDeps = () => ({
+  publishSession: vi.fn(),
+  createCandidateSession: async (
+    _serialized: string,
+    live: Parameters<typeof sdkCutoverPersist>[4],
+  ) => live!,
 });
 
 describe("shouldUseSdkCutover", () => {
@@ -141,13 +152,11 @@ describe("shouldUseSdkCutover", () => {
 });
 
 describe("sdkCutoverPersist", () => {
-  const makeRef = <T>(val: T): MutableRefObject<T> => ({ current: val });
-
   const makeDeps = (overrides: Partial<Parameters<typeof sdkCutoverPersist>[5]> = {}) => ({
     editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
     writeProjectFile: vi.fn().mockResolvedValue(undefined),
     reloadPreview: vi.fn(),
-    domEditSaveTimestampRef: makeRef(0),
+    ...candidateTestDeps(),
     ...overrides,
   });
 
@@ -175,7 +184,7 @@ describe("sdkCutoverPersist", () => {
       null,
       deps,
     );
-    expect(result).toBe(false);
+    expect(result.status).toBe("declined");
   });
 
   it("returns false when element not found in session", async () => {
@@ -190,7 +199,7 @@ describe("sdkCutoverPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(false);
+    expect(result.status).toBe("declined");
   });
 
   it("dispatches setStyle for inline-style ops", async () => {
@@ -205,13 +214,13 @@ describe("sdkCutoverPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     expect(session!.dispatch).toHaveBeenCalledWith({
       type: "setStyle",
       target: "hf-abc",
       styles: { color: "red", opacity: "0.5" },
     });
-    expect(deps.writeProjectFile).toHaveBeenCalledWith("/comp.html", "<html></html>");
+    expect(deps.writeProjectFile).toHaveBeenCalledWith("/comp.html", "<html></html>", "before");
     expect(deps.reloadPreview).toHaveBeenCalled();
   });
 
@@ -227,7 +236,7 @@ describe("sdkCutoverPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     expect(session!.dispatch).toHaveBeenCalledWith({
       type: "setText",
       target: "hf-abc",
@@ -251,7 +260,7 @@ describe("sdkCutoverPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(false);
+    expect(result.status).toBe("declined");
     expect(session!.dispatch).not.toHaveBeenCalled();
     expect(deps.writeProjectFile).not.toHaveBeenCalled();
   });
@@ -268,7 +277,7 @@ describe("sdkCutoverPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     expect(session!.dispatch).toHaveBeenCalledWith({
       type: "setAttribute",
       target: "hf-abc",
@@ -289,7 +298,7 @@ describe("sdkCutoverPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     expect(session!.dispatch).toHaveBeenCalledWith({
       type: "setAttribute",
       target: "hf-abc",
@@ -337,7 +346,7 @@ describe("sdkCutoverPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(false);
+    expect(result.status).toBe("failed");
     expect(deps.reloadPreview).not.toHaveBeenCalled();
   });
 
@@ -376,19 +385,428 @@ describe("sdkCutoverPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(false);
+    expect(result.status).toBe("failed");
     expect(deps.writeProjectFile).not.toHaveBeenCalled();
     expect(deps.reloadPreview).not.toHaveBeenCalled();
   });
 });
 
+describe("transactional SDK candidate publication", () => {
+  const html = `<!DOCTYPE html><html data-composition-variables='[]'><body>
+<div data-hf-id="hf-stage" data-hf-root><div data-hf-id="hf-box" data-start="0" data-duration="1"></div>
+<script>var tl = gsap.timeline({ paused: true });
+tl.to('[data-hf-id="hf-box"]', { duration: 1, x: 100 }, 0);
+window.__timelines = { main: tl };</script></div>
+</body></html>`;
+
+  it.each([
+    [
+      "style",
+      (session: Awaited<ReturnType<typeof openComposition>>) =>
+        session.setStyle("hf-box", { color: "red" }),
+    ],
+    [
+      "timing",
+      (session: Awaited<ReturnType<typeof openComposition>>) =>
+        session.setTiming("hf-box", { start: 2 }),
+    ],
+    [
+      "delete",
+      (session: Awaited<ReturnType<typeof openComposition>>) => session.removeElement("hf-box"),
+    ],
+    [
+      "variables",
+      (session: Awaited<ReturnType<typeof openComposition>>) =>
+        session.declareVariable({ id: "title", type: "string", label: "Title", default: "Hello" }),
+    ],
+    [
+      "grouping/structure",
+      (session: Awaited<ReturnType<typeof openComposition>>) =>
+        session.addElement(null, 0, '<div data-hf-group="group-1"></div>'),
+    ],
+    [
+      "GSAP",
+      (session: Awaited<ReturnType<typeof openComposition>>) => {
+        const animationId = session.getElement("hf-box")?.animationIds[0];
+        if (!animationId) throw new Error("missing fixture animation");
+        session.setGsapTween(animationId, { ease: "power2.in" });
+      },
+    ],
+  ])(
+    "restores disk and keeps the live session unchanged when %s history fails",
+    async (_name, mutate) => {
+      const live = await openComposition(html, { history: false });
+      const liveBefore = live.serialize();
+      let disk = html;
+      const publishSession = vi.fn();
+      const result = await persistSdkCandidateMutation(
+        live,
+        "/comp.html",
+        html,
+        {
+          editHistory: { recordEdit: vi.fn().mockRejectedValue(new Error("history failed")) },
+          writeProjectFile: vi.fn(async (_path: string, content: string) => {
+            disk = content;
+          }),
+          reloadPreview: vi.fn(),
+          publishSession,
+        },
+        mutate,
+        { label: `Edit ${_name}` },
+      );
+
+      expect(result.status).toBe("failed");
+      expect(disk).toBe(html);
+      expect(live.serialize()).toBe(liveBefore);
+      expect(publishSession).not.toHaveBeenCalled();
+      expect(() => cutoverCommittedOrThrow(result)).toThrow("history failed");
+      live.dispose();
+    },
+  );
+
+  it("disposes a mutated real candidate and leaves the live session unpublished when the write fails", async () => {
+    const live = await openComposition(html, { history: false });
+    const liveBefore = live.serialize();
+    let candidate: Awaited<ReturnType<typeof openComposition>> | undefined;
+    let disposeCandidate: ReturnType<typeof vi.spyOn> | undefined;
+    const publishSession = vi.fn().mockReturnValue("published");
+    const writeError = new Error("write failed");
+    const writeProjectFile = vi.fn().mockRejectedValue(writeError);
+    const result = await persistSdkCandidateMutation(
+      live,
+      "/comp.html",
+      html,
+      {
+        editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
+        writeProjectFile,
+        reloadPreview: vi.fn(),
+        createCandidateSession: async (source) => {
+          candidate = await openComposition(source, { history: false });
+          disposeCandidate = vi.spyOn(candidate, "dispose");
+          return candidate;
+        },
+        publishSession,
+      },
+      (next) => next.setStyle("hf-box", { color: "red" }),
+    );
+
+    expect(result).toMatchObject({ status: "failed", error: writeError });
+    expect(writeProjectFile).toHaveBeenCalledOnce();
+    expect(writeProjectFile.mock.calls[0]?.[0]).toBe("/comp.html");
+    expect(writeProjectFile.mock.calls[0]?.[1]).toContain("color: red");
+    expect(live.serialize()).toBe(liveBefore);
+    expect(publishSession).not.toHaveBeenCalled();
+    expect(disposeCandidate).toHaveBeenCalledOnce();
+    live.dispose();
+  });
+
+  it("publishes the candidate only after write and history commit", async () => {
+    const live = await openComposition(html, { history: false });
+    const liveBefore = live.serialize();
+    const order: string[] = [];
+    let published: Awaited<ReturnType<typeof openComposition>> | undefined;
+    const result = await persistSdkCandidateMutation(
+      live,
+      "/comp.html",
+      html,
+      {
+        editHistory: {
+          recordEdit: vi.fn(async () => {
+            order.push("history");
+          }),
+        },
+        writeProjectFile: vi.fn(async () => {
+          order.push("write");
+        }),
+        reloadPreview: vi.fn(() => order.push("refresh")),
+        publishSession: ({ candidate }) => {
+          order.push("publish");
+          published = candidate;
+          return "published";
+        },
+      },
+      (candidate) => candidate.setStyle("hf-box", { color: "red" }),
+    );
+
+    expect(result.status).toBe("committed");
+    expect(order).toEqual(["write", "history", "publish", "refresh"]);
+    expect(live.serialize()).toBe(liveBefore);
+    expect(published?.serialize()).toContain("color: red");
+    live.dispose();
+    published?.dispose();
+  });
+
+  it("keeps the durable commit authoritative when a publisher throws after publication", async () => {
+    const live = await openComposition(html, { history: false });
+    let disk = html;
+    let published: Awaited<ReturnType<typeof openComposition>> | undefined;
+    const recordEdit = vi.fn().mockResolvedValue(undefined);
+    const writeProjectFile = vi.fn(async (_path: string, content: string) => {
+      disk = content;
+    });
+    const result = await persistSdkCandidateMutation(
+      live,
+      "/comp.html",
+      html,
+      {
+        editHistory: { recordEdit },
+        writeProjectFile,
+        reloadPreview: vi.fn(),
+        publishSession: ({ candidate }) => {
+          published = candidate;
+          throw new Error("cleanup after publish failed");
+        },
+      },
+      (candidate) => candidate.setStyle("hf-box", { color: "red" }),
+    );
+
+    expect(result.status).toBe("committed");
+    expect(disk).toContain("color: red");
+    expect(writeProjectFile).toHaveBeenCalledTimes(1);
+    expect(recordEdit).toHaveBeenCalledTimes(1);
+    expect(published?.serialize()).toContain("color: red");
+    live.dispose();
+    published?.dispose();
+  });
+
+  it("serializes overlapping SDK edits and rebases each candidate on the latest disk bytes", async () => {
+    const live = await openComposition(html, { history: false });
+    let disk = html;
+    const published: Array<Awaited<ReturnType<typeof openComposition>>> = [];
+    const writeProjectFile = vi.fn(async (_path: string, content: string) => {
+      // Yield inside the write to make overlap deterministic.
+      await Promise.resolve();
+      disk = content;
+    });
+    const deps = {
+      editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
+      writeProjectFile,
+      readProjectFile: vi.fn(async () => disk),
+      reloadPreview: vi.fn(),
+      publishSession: ({ candidate }) => {
+        published.push(candidate);
+        return "published";
+      },
+    };
+
+    const [first, second] = await Promise.all([
+      persistSdkCandidateMutation(live, "/comp.html", html, deps, (candidate) =>
+        candidate.setStyle("hf-box", { color: "red" }),
+      ),
+      persistSdkCandidateMutation(live, "/comp.html", html, deps, (candidate) =>
+        candidate.setStyle("hf-box", { backgroundColor: "blue" }),
+      ),
+    ]);
+
+    expect(first.status).toBe("committed");
+    expect(second.status).toBe("committed");
+    expect(disk).toContain("color: red");
+    expect(disk).toContain("background-color: blue");
+    expect(writeProjectFile).toHaveBeenCalledTimes(2);
+    live.dispose();
+    for (const candidate of published) candidate.dispose();
+  });
+
+  it("fails instead of cloning stale bytes when the authoritative queued read rejects", async () => {
+    const live = await openComposition(html, { history: false });
+    let disk = html;
+    let readCount = 0;
+    const writeProjectFile = vi.fn(async (_path: string, content: string) => {
+      disk = content;
+    });
+    const deps = {
+      editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
+      writeProjectFile,
+      readProjectFile: vi.fn(async () => {
+        readCount++;
+        if (readCount === 1) return disk;
+        throw new Error("transient read failure");
+      }),
+      reloadPreview: vi.fn(),
+      publishSession: vi.fn().mockReturnValue("published"),
+    };
+
+    const first = await persistSdkCandidateMutation(live, "/comp.html", html, deps, (candidate) =>
+      candidate.setStyle("hf-box", { color: "red" }),
+    );
+    const second = await persistSdkCandidateMutation(live, "/comp.html", html, deps, (candidate) =>
+      candidate.setStyle("hf-box", { backgroundColor: "blue" }),
+    );
+
+    expect(first.status).toBe("committed");
+    expect(second).toMatchObject({ status: "failed", error: new Error("transient read failure") });
+    expect(disk).toContain("color: red");
+    expect(disk).not.toContain("background-color: blue");
+    expect(writeProjectFile).toHaveBeenCalledTimes(1);
+    live.dispose();
+  });
+
+  it("does not publish a delayed candidate after the active composition switches", async () => {
+    const liveA = await openComposition(html, { history: false });
+    const liveB = await openComposition(html.replace("hf-box", "hf-other"), { history: false });
+    const candidateA = await openComposition(html, { history: false });
+    const disposeCandidate = vi.spyOn(candidateA, "dispose");
+    let activePath = "/a.html";
+    let currentSession = liveA;
+    let releaseHistory: (() => void) | undefined;
+    const historyStarted = new Promise<void>((resolve) => {
+      releaseHistory = resolve;
+    });
+    let notifyHistoryStarted: (() => void) | undefined;
+    const didStartHistory = new Promise<void>((resolve) => {
+      notifyHistoryStarted = resolve;
+    });
+    const published: Array<Awaited<ReturnType<typeof openComposition>>> = [];
+    const refresh = vi.fn();
+    const pending = persistSdkCandidateMutation(
+      liveA,
+      "/a.html",
+      html,
+      {
+        editHistory: {
+          recordEdit: vi.fn(async () => {
+            notifyHistoryStarted?.();
+            await historyStarted;
+          }),
+        },
+        writeProjectFile: vi.fn().mockResolvedValue(undefined),
+        readProjectFile: vi.fn().mockResolvedValue(html),
+        reloadPreview: vi.fn(),
+        refresh,
+        createCandidateSession: vi.fn().mockResolvedValue(candidateA),
+        publishSession: ({ candidate, expectedSession, targetPath }) => {
+          if (activePath !== targetPath || currentSession !== expectedSession) {
+            return "rejected-inactive-target";
+          }
+          currentSession = candidate;
+          published.push(candidate);
+          return "published";
+        },
+      },
+      (candidate) => candidate.setStyle("hf-box", { color: "red" }),
+    );
+
+    await didStartHistory;
+    activePath = "/b.html";
+    currentSession = liveB;
+    releaseHistory?.();
+
+    expect((await pending).status).toBe("committed");
+    expect(currentSession).toBe(liveB);
+    expect(published).toHaveLength(0);
+    expect(disposeCandidate).toHaveBeenCalledOnce();
+    expect(refresh).not.toHaveBeenCalled();
+    liveA.dispose();
+    liveB.dispose();
+  });
+});
+
+describe("persistSdkSerialize — shared per-file transaction boundary", () => {
+  const html = `<!DOCTYPE html><html data-composition-variables='[]'><body>
+<div data-hf-id="hf-stage" data-hf-root><div data-hf-id="hf-box" data-start="0" data-duration="1"></div></div>
+</body></html>`;
+
+  const makeDeps = (disk: { current: string }) => ({
+    editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
+    writeProjectFile: vi.fn(async (_path: string, content: string) => {
+      disk.current = content;
+    }),
+    readProjectFile: vi.fn(async () => disk.current),
+    reloadPreview: vi.fn(),
+  });
+
+  it("rebases overlapping whole-file transforms on the latest committed bytes", async () => {
+    const disk = { current: "<html><body></body></html>" };
+    let releaseFirstWrite: (() => void) | undefined;
+    const firstWriteStarted = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    let notifyFirstWriteStarted: (() => void) | undefined;
+    const didStartFirstWrite = new Promise<void>((resolve) => {
+      notifyFirstWriteStarted = resolve;
+    });
+    const deps = makeDeps(disk);
+    deps.writeProjectFile.mockImplementationOnce(async (_path: string, content: string) => {
+      notifyFirstWriteStarted?.();
+      await firstWriteStarted;
+      disk.current = content;
+    });
+
+    const first = persistSdkSerialize(
+      (before) => before.replace("</body>", "<div>A</div></body>"),
+      "/comp.html",
+      disk.current,
+      deps,
+    );
+    await didStartFirstWrite;
+    const second = persistSdkSerialize(
+      (before) => before.replace("</body>", "<div>B</div></body>"),
+      "/comp.html",
+      disk.current,
+      deps,
+    );
+    releaseFirstWrite?.();
+    await Promise.all([first, second]);
+
+    expect(disk.current).toContain("<div>A</div>");
+    expect(disk.current).toContain("<div>B</div>");
+  });
+
+  it("shares the same queue with candidate mutations", async () => {
+    const disk = { current: html };
+    const live = await openComposition(html, { history: false });
+    const published: Array<Awaited<ReturnType<typeof openComposition>>> = [];
+    const deps = {
+      ...makeDeps(disk),
+      publishSession: ({
+        candidate,
+      }: {
+        candidate: Awaited<ReturnType<typeof openComposition>>;
+      }) => {
+        published.push(candidate);
+        return "published";
+      },
+    };
+    let releaseCandidateWrite: (() => void) | undefined;
+    const candidateWriteGate = new Promise<void>((resolve) => {
+      releaseCandidateWrite = resolve;
+    });
+    let notifyCandidateWriteStarted: (() => void) | undefined;
+    const candidateWriteStarted = new Promise<void>((resolve) => {
+      notifyCandidateWriteStarted = resolve;
+    });
+    deps.writeProjectFile.mockImplementationOnce(async (_path: string, content: string) => {
+      notifyCandidateWriteStarted?.();
+      await candidateWriteGate;
+      disk.current = content;
+    });
+
+    const candidateEdit = persistSdkCandidateMutation(live, "/comp.html", html, deps, (candidate) =>
+      candidate.setStyle("hf-box", { color: "red" }),
+    );
+    await candidateWriteStarted;
+    const islandEdit = persistSdkSerialize(
+      (before) => before.replace("</body>", "<script>island</script></body>"),
+      "/comp.html",
+      html,
+      deps,
+    );
+    releaseCandidateWrite?.();
+    await Promise.all([candidateEdit, islandEdit]);
+
+    expect(disk.current).toContain("color: red");
+    expect(disk.current).toContain("<script>island</script>");
+    live.dispose();
+    for (const candidate of published) candidate.dispose();
+  });
+});
+
 describe("sdkDeletePersist", () => {
-  const makeRef = <T>(val: T): MutableRefObject<T> => ({ current: val });
   const makeDeps = () => ({
     editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
     writeProjectFile: vi.fn().mockResolvedValue(undefined),
     reloadPreview: vi.fn(),
-    domEditSaveTimestampRef: makeRef(0),
+    ...candidateTestDeps(),
   });
 
   const makeSession = (hasEl = true) =>
@@ -403,23 +821,29 @@ describe("sdkDeletePersist", () => {
     }) as unknown as Parameters<typeof sdkDeletePersist>[3];
 
   it("returns false when session is null", async () => {
-    expect(await sdkDeletePersist("hf-abc", "before", "/comp.html", null, makeDeps())).toBe(false);
+    expect(
+      (await sdkDeletePersist("hf-abc", "before", "/comp.html", null, makeDeps())).status,
+    ).toBe("declined");
   });
 
   it("returns false when element not found in session", async () => {
     const session = makeSession(false);
-    expect(await sdkDeletePersist("hf-abc", "before", "/comp.html", session, makeDeps())).toBe(
-      false,
-    );
+    expect(
+      (await sdkDeletePersist("hf-abc", "before", "/comp.html", session, makeDeps())).status,
+    ).toBe("declined");
   });
 
   it("calls removeElement and writes serialized content", async () => {
     const deps = makeDeps();
     const session = makeSession(true);
     const result = await sdkDeletePersist("hf-abc", "before", "/comp.html", session, deps);
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     expect(session!.removeElement).toHaveBeenCalledWith("hf-abc");
-    expect(deps.writeProjectFile).toHaveBeenCalledWith("/comp.html", "<html>after</html>");
+    expect(deps.writeProjectFile).toHaveBeenCalledWith(
+      "/comp.html",
+      "<html>after</html>",
+      "before",
+    );
   });
 
   it("records edit history with before/after diff", async () => {
@@ -448,19 +872,18 @@ describe("sdkDeletePersist", () => {
       throw new Error("remove failed");
     });
     const result = await sdkDeletePersist("hf-abc", "before", "/comp.html", session, deps);
-    expect(result).toBe(false);
+    expect(result.status).toBe("failed");
     expect(deps.writeProjectFile).not.toHaveBeenCalled();
     expect(deps.reloadPreview).not.toHaveBeenCalled();
   });
 });
 
 describe("sdkTimingPersist", () => {
-  const makeRef = <T>(val: T): MutableRefObject<T> => ({ current: val });
   const makeDeps = () => ({
     editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
     writeProjectFile: vi.fn().mockResolvedValue(undefined),
     reloadPreview: vi.fn(),
-    domEditSaveTimestampRef: makeRef(0),
+    ...candidateTestDeps(),
   });
 
   const makeSession = (hasEl = true) =>
@@ -475,16 +898,16 @@ describe("sdkTimingPersist", () => {
     }) as unknown as Parameters<typeof sdkTimingPersist>[3];
 
   it("returns false when session is null", async () => {
-    expect(await sdkTimingPersist("hf-clip", "/comp.html", { start: 1 }, null, makeDeps())).toBe(
-      false,
-    );
+    expect(
+      (await sdkTimingPersist("hf-clip", "/comp.html", { start: 1 }, null, makeDeps())).status,
+    ).toBe("declined");
   });
 
   it("returns false when element not found in session", async () => {
     const session = makeSession(false);
-    expect(await sdkTimingPersist("hf-clip", "/comp.html", { start: 1 }, session, makeDeps())).toBe(
-      false,
-    );
+    expect(
+      (await sdkTimingPersist("hf-clip", "/comp.html", { start: 1 }, session, makeDeps())).status,
+    ).toBe("declined");
   });
 
   it("calls setTiming with provided update and writes serialized content", async () => {
@@ -497,13 +920,17 @@ describe("sdkTimingPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     expect(session!.setTiming).toHaveBeenCalledWith("hf-clip", {
       start: 2,
       duration: 5,
       trackIndex: 1,
     });
-    expect(deps.writeProjectFile).toHaveBeenCalledWith("/comp.html", "<html>after</html>");
+    expect(deps.writeProjectFile).toHaveBeenCalledWith(
+      "/comp.html",
+      "<html>after</html>",
+      "<html>before</html>",
+    );
   });
 
   it("captures before-state before setTiming dispatch", async () => {
@@ -524,7 +951,7 @@ describe("sdkTimingPersist", () => {
       throw new Error("timing error");
     });
     const result = await sdkTimingPersist("hf-clip", "/comp.html", { start: 1 }, session, deps);
-    expect(result).toBe(false);
+    expect(result.status).toBe("failed");
     expect(deps.writeProjectFile).not.toHaveBeenCalled();
   });
 
@@ -539,6 +966,7 @@ describe("sdkTimingPersist", () => {
     const session = makeSession(true);
     await sdkTimingPersist("hf-clip", "/comp.html", { start: 3 }, session, deps);
     expect(deps.readProjectFile).toHaveBeenCalledWith("/comp.html");
+    expect(deps.readProjectFile).toHaveBeenCalledOnce();
     expect(deps.editHistory.recordEdit).toHaveBeenCalledWith(
       expect.objectContaining({
         files: {
@@ -548,23 +976,20 @@ describe("sdkTimingPersist", () => {
     );
   });
 
-  it("falls back to serialize() before when the reader throws", async () => {
+  it("fails without writing when the authoritative reader throws", async () => {
     const deps = {
       ...makeDeps(),
       readProjectFile: vi.fn().mockRejectedValue(new Error("read failed")),
     };
     const session = makeSession(true);
-    await sdkTimingPersist("hf-clip", "/comp.html", { start: 3 }, session, deps);
-    expect(deps.editHistory.recordEdit).toHaveBeenCalledWith(
-      expect.objectContaining({
-        files: { "/comp.html": { before: "<html>before</html>", after: "<html>after</html>" } },
-      }),
-    );
+    const result = await sdkTimingPersist("hf-clip", "/comp.html", { start: 3 }, session, deps);
+    expect(result).toMatchObject({ status: "failed", error: new Error("read failed") });
+    expect(deps.writeProjectFile).not.toHaveBeenCalled();
+    expect(deps.editHistory.recordEdit).not.toHaveBeenCalled();
   });
 });
 
 describe("sdkGsapTweenPersist — undo baseline (finding #12)", () => {
-  const makeRef = <T>(val: T): MutableRefObject<T> => ({ current: val });
   const makeSession = () =>
     ({
       getElement: vi.fn().mockReturnValue({ id: "hf-box" }),
@@ -581,8 +1006,8 @@ describe("sdkGsapTweenPersist — undo baseline (finding #12)", () => {
       editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
       writeProjectFile: vi.fn().mockResolvedValue(undefined),
       reloadPreview: vi.fn(),
-      domEditSaveTimestampRef: makeRef(0),
       readProjectFile: vi.fn().mockResolvedValue("<html>on-disk gsap bytes</html>"),
+      ...candidateTestDeps(),
     };
     const session = makeSession();
     await sdkGsapTweenPersist(
@@ -591,6 +1016,7 @@ describe("sdkGsapTweenPersist — undo baseline (finding #12)", () => {
       session,
       deps,
     );
+    expect(deps.readProjectFile).toHaveBeenCalledOnce();
     expect(deps.editHistory.recordEdit).toHaveBeenCalledWith(
       expect.objectContaining({
         files: {
@@ -602,18 +1028,18 @@ describe("sdkGsapTweenPersist — undo baseline (finding #12)", () => {
 });
 
 describe("sdkGsapTweenPersist — per-file serialization (finding #8)", () => {
-  const makeRef = <T>(val: T): MutableRefObject<T> => ({ current: val });
-
-  it("routes the read-modify-write through the keyed serializer so same-file flushes can't interleave", async () => {
+  it("routes the read-modify-write through the shared file coordinator", async () => {
     const order: string[] = [];
     let writeResolve: (() => void) | null = null;
+    let writeCall = 0;
     const deps = {
       editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
       // First write blocks until we release it, so without serialization the
       // second op's serialize()/dispatch would interleave ahead of it.
       writeProjectFile: vi.fn().mockImplementation((_p: string, content: string) => {
+        writeCall++;
         order.push(`write-start:${content}`);
-        if (content === "<html>after-1</html>") {
+        if (writeCall === 1) {
           return new Promise<void>((res) => {
             writeResolve = () => {
               order.push(`write-done:${content}`);
@@ -625,17 +1051,7 @@ describe("sdkGsapTweenPersist — per-file serialization (finding #8)", () => {
         return Promise.resolve();
       }),
       reloadPreview: vi.fn(),
-      domEditSaveTimestampRef: makeRef(0),
-      // A real per-key serializer: tasks under the same key run strictly in order.
-      serialize: (() => {
-        const inFlight = new Map<string, Promise<unknown>>();
-        return <T>(key: string, task: () => Promise<T>): Promise<T> => {
-          const prior = inFlight.get(key) ?? Promise.resolve();
-          const next = prior.then(task, task);
-          inFlight.set(key, next);
-          return next as Promise<T>;
-        };
-      })(),
+      ...candidateTestDeps(),
     };
 
     let serializeCall = 0;
@@ -662,27 +1078,28 @@ describe("sdkGsapTweenPersist — per-file serialization (finding #8)", () => {
       session,
       deps,
     );
-    // Let the first op reach its (blocked) write before releasing it.
-    await Promise.resolve();
-    await Promise.resolve();
+    // Let the first op finish candidate construction and reach its blocked write.
+    await vi.waitFor(() => expect(writeResolve).not.toBeNull());
     writeResolve?.();
     await Promise.all([p1, p2]);
 
     // The second op's write must NOT start before the first op's write completes.
-    const firstWriteDone = order.indexOf("write-done:<html>after-1</html>");
-    const secondWriteStart = order.indexOf("write-start:<html>after-2</html>");
+    const firstWriteDone = order.findIndex((entry) => entry.startsWith("write-done:"));
+    const writeStarts = order
+      .map((entry, index) => (entry.startsWith("write-start:") ? index : -1))
+      .filter((index) => index >= 0);
+    const secondWriteStart = writeStarts[1] ?? -1;
     expect(firstWriteDone).toBeGreaterThanOrEqual(0);
     expect(secondWriteStart).toBeGreaterThan(firstWriteDone);
   });
 });
 
 describe("sdkGsapTweenPersist", () => {
-  const makeRef = <T>(val: T): MutableRefObject<T> => ({ current: val });
   const makeDeps = () => ({
     editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
     writeProjectFile: vi.fn().mockResolvedValue(undefined),
     reloadPreview: vi.fn(),
-    domEditSaveTimestampRef: makeRef(0),
+    ...candidateTestDeps(),
   });
 
   const makeSession = (opts?: { addGsapTween?: string; hasEl?: boolean }) =>
@@ -706,7 +1123,7 @@ describe("sdkGsapTweenPersist", () => {
         null,
         makeDeps(),
       ),
-    ).toBe(false);
+    ).toMatchObject({ status: "declined" });
   });
 
   it("calls addGsapTween and writes for kind=add", async () => {
@@ -722,12 +1139,16 @@ describe("sdkGsapTweenPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     expect(session!.addGsapTween).toHaveBeenCalledWith(
       "hf-box",
       expect.objectContaining({ method: "to" }),
     );
-    expect(deps.writeProjectFile).toHaveBeenCalledWith("/comp.html", "<html>after</html>");
+    expect(deps.writeProjectFile).toHaveBeenCalledWith(
+      "/comp.html",
+      "<html>after</html>",
+      "<html>before</html>",
+    );
   });
 
   it("returns false for kind=add when element not found", async () => {
@@ -739,7 +1160,7 @@ describe("sdkGsapTweenPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(false);
+    expect(result.status).toBe("declined");
     expect(deps.writeProjectFile).not.toHaveBeenCalled();
   });
 
@@ -752,7 +1173,7 @@ describe("sdkGsapTweenPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     expect(session!.setGsapTween).toHaveBeenCalledWith("tw-1", { ease: "power3.in" });
     expect(deps.reloadPreview).toHaveBeenCalled();
   });
@@ -766,7 +1187,7 @@ describe("sdkGsapTweenPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     expect(session!.removeGsapTween).toHaveBeenCalledWith("tw-1");
   });
 
@@ -782,18 +1203,17 @@ describe("sdkGsapTweenPersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(false);
+    expect(result.status).toBe("failed");
     expect(deps.writeProjectFile).not.toHaveBeenCalled();
   });
 });
 
 describe("sdkGsapKeyframePersist", () => {
-  const makeRef = <T>(val: T): MutableRefObject<T> => ({ current: val });
   const makeDeps = () => ({
     editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
     writeProjectFile: vi.fn().mockResolvedValue(undefined),
     reloadPreview: vi.fn(),
-    domEditSaveTimestampRef: makeRef(0),
+    ...candidateTestDeps(),
   });
 
   const makeSession = () =>
@@ -809,7 +1229,7 @@ describe("sdkGsapKeyframePersist", () => {
   it("returns false when session is null", async () => {
     expect(
       await sdkGsapKeyframePersist("/comp.html", "tw-1", 50, { opacity: 0.5 }, null, makeDeps()),
-    ).toBe(false);
+    ).toMatchObject({ status: "declined" });
   });
 
   it("dispatches addGsapKeyframe and writes serialized content", async () => {
@@ -823,14 +1243,18 @@ describe("sdkGsapKeyframePersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     expect(session!.dispatch).toHaveBeenCalledWith({
       type: "addGsapKeyframe",
       animationId: "tw-1",
       position: 50,
       value: { opacity: 0.5 },
     });
-    expect(deps.writeProjectFile).toHaveBeenCalledWith("/comp.html", "<html>after</html>");
+    expect(deps.writeProjectFile).toHaveBeenCalledWith(
+      "/comp.html",
+      "<html>after</html>",
+      "<html>before</html>",
+    );
     expect(deps.reloadPreview).toHaveBeenCalled();
   });
 
@@ -848,18 +1272,17 @@ describe("sdkGsapKeyframePersist", () => {
       session,
       deps,
     );
-    expect(result).toBe(false);
+    expect(result.status).toBe("failed");
     expect(deps.writeProjectFile).not.toHaveBeenCalled();
   });
 });
 
 describe("sdkCutoverPersist — GSAP script preservation (integration)", () => {
-  const makeRef = <T>(val: T): MutableRefObject<T> => ({ current: val });
   const makeDeps = () => ({
     editHistory: { recordEdit: vi.fn().mockResolvedValue(undefined) },
     writeProjectFile: vi.fn().mockResolvedValue(undefined),
     reloadPreview: vi.fn(),
-    domEditSaveTimestampRef: makeRef(0),
+    ...candidateTestDeps(),
   });
 
   it("preserves GSAP <script> block and data-position-mode through setStyle dispatch", async () => {
@@ -880,7 +1303,7 @@ gsap.timeline().to('[data-hf-id="hf-layer"]', { duration: 1, x: 100 });
       comp,
       deps,
     );
-    expect(result).toBe(true);
+    expect(result.status).toBe("committed");
     const written = (deps.writeProjectFile as ReturnType<typeof vi.fn>).mock
       .calls[0]?.[1] as string;
     expect(written).toContain("data-hf-gsap");

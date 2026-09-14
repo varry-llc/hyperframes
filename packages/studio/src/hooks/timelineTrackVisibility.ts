@@ -1,7 +1,15 @@
 import { useCallback } from "react";
 import { usePlayerStore, type TimelineElement } from "../player";
+import { reseekPreviewAtTime } from "../player/hooks/timelineSyncHydration";
 import { useExpandedTimelineElements } from "../player/hooks/useExpandedTimelineElements";
+import { applySoftReloadFinalization } from "../utils/gsapSoftReload";
+import {
+  timelineTrackOrder,
+  trackDisplayNumber,
+  trackDisplaySuffix,
+} from "../player/components/timelineTrackDisplay";
 import { saveProjectFilesWithHistory } from "../utils/studioFileHistory";
+import { isAudioTimelineElement } from "../utils/timelineInspector";
 import { readTagSnippetByTarget, type PatchOperation } from "../utils/sourcePatcher";
 import {
   applyPatchByTarget,
@@ -11,7 +19,7 @@ import {
   type RecordEditInput,
 } from "./timelineEditingHelpers";
 
-interface MutableRef<T> {
+export interface MutableRef<T> {
   current: T;
 }
 
@@ -25,15 +33,18 @@ interface ToggleTimelineTrackHiddenInput {
   timelineElements: readonly TimelineElement[];
   track: number;
   hidden: boolean;
+  /** The row the CLICKED control announced. Absent when the caller has no
+   *  rendered number to hand over, which falls back to deriving one. */
+  displayNumber?: number | null;
   previewIframe: HTMLIFrameElement | null;
   writeProjectFile: (path: string, content: string) => Promise<void>;
   recordEdit: (input: RecordEditInput) => Promise<void>;
-  domEditSaveTimestampRef: MutableRef<number>;
   pendingTimelineEditPathRef: MutableRef<Set<string>>;
 }
 
 interface ToggleTimelineElementHiddenInput extends Omit<ToggleTimelineTrackHiddenInput, "track"> {
-  elementKey: string;
+  /** One timeline key, or several to hide/show in a single atomic file write. */
+  elementKey: string | readonly string[];
 }
 
 interface SetElementsHiddenInput {
@@ -45,7 +56,6 @@ interface SetElementsHiddenInput {
   previewIframe: HTMLIFrameElement | null;
   writeProjectFile: (path: string, content: string) => Promise<void>;
   recordEdit: (input: RecordEditInput) => Promise<void>;
-  domEditSaveTimestampRef: MutableRef<number>;
   pendingTimelineEditPathRef: MutableRef<Set<string>>;
 }
 
@@ -60,9 +70,9 @@ interface UseTimelineTrackVisibilityEditingInput extends Omit<
   forceReloadSdkSession?: () => void;
 }
 
-interface UseTimelineElementVisibilityEditingInput extends Omit<
+export interface UseTimelineElementVisibilityEditingInput extends Omit<
   ToggleTimelineElementHiddenInput,
-  "projectId" | "elementKey" | "hidden" | "previewIframe"
+  "projectId" | "elementKey" | "hidden" | "previewIframe" | "timelineElements"
 > {
   projectIdRef: ReadonlyRef<string | null>;
   previewIframeRef: ReadonlyRef<HTMLIFrameElement | null>;
@@ -82,9 +92,10 @@ function patchLiveHiddenState(
   iframe: HTMLIFrameElement | null,
   elements: readonly TimelineElement[],
   hidden: boolean,
+  activeCompPath: string | null,
 ): void {
   for (const element of elements) {
-    const target = findTimelineElementInIframe(iframe, element);
+    const target = findTimelineElementInIframe(iframe, element, activeCompPath);
     if (!target) continue;
     if (hidden) {
       target.setAttribute("data-hidden", "");
@@ -94,15 +105,13 @@ function patchLiveHiddenState(
   }
 }
 
-function reseekPreviewRuntime(iframe: HTMLIFrameElement | null): void {
-  try {
-    const win: (Window & { __player?: { seek?: (time: number) => void } }) | null =
-      iframe?.contentWindow ?? null;
-    win?.__player?.seek?.(usePlayerStore.getState().currentTime);
-  } catch {}
+export function reseekPreviewRuntime(iframe: HTMLIFrameElement | null): void {
+  const store = usePlayerStore.getState();
+  if (applySoftReloadFinalization(iframe, store.currentTime)) return;
+  reseekPreviewAtTime({ seek: store.requestSeek }, store.currentTime);
 }
 
-function groupElementsByTargetPath(
+export function groupElementsByTargetPath(
   elements: readonly TimelineElement[],
   activeCompPath: string | null,
 ): Map<string, TimelineElement[]> {
@@ -129,12 +138,11 @@ async function setElementsHidden({
   previewIframe,
   writeProjectFile,
   recordEdit,
-  domEditSaveTimestampRef,
   pendingTimelineEditPathRef,
 }: SetElementsHiddenInput): Promise<string[]> {
   if (elements.length === 0) return [];
 
-  patchLiveHiddenState(previewIframe, elements, hidden);
+  patchLiveHiddenState(previewIframe, elements, hidden, activeCompPath);
   reseekPreviewRuntime(previewIframe);
 
   const hiddenOperation: PatchOperation = {
@@ -165,7 +173,6 @@ async function setElementsHidden({
       pendingTimelineEditPathRef.current.add(targetPath);
     }
 
-    domEditSaveTimestampRef.current = Date.now();
     const changedPaths = await saveProjectFilesWithHistory({
       projectId,
       label,
@@ -179,7 +186,6 @@ async function setElementsHidden({
       writeFile: writeProjectFile,
       recordEdit,
     });
-    domEditSaveTimestampRef.current = Date.now();
     for (const element of elements) {
       usePlayerStore.getState().updateElement(element.key ?? element.id, { hidden });
     }
@@ -188,7 +194,7 @@ async function setElementsHidden({
     // The optimistic live patch already ran; a patch-target/save failure here would
     // otherwise leave the preview showing the wrong visibility until a reload. Revert
     // the live DOM to the prior state so what's on screen matches what persisted.
-    patchLiveHiddenState(previewIframe, elements, !hidden);
+    patchLiveHiddenState(previewIframe, elements, !hidden, activeCompPath);
     reseekPreviewRuntime(previewIframe);
     throw error;
   }
@@ -200,22 +206,39 @@ export async function toggleTimelineTrackHidden({
   timelineElements,
   track,
   hidden,
+  displayNumber,
   previewIframe,
   writeProjectFile,
   recordEdit,
-  domEditSaveTimestampRef,
   pendingTimelineEditPathRef,
 }: ToggleTimelineTrackHiddenInput): Promise<string[]> {
+  // `track` is the fractional sort key the callback needs; the history entry is
+  // read by a human, so it gets the display row instead — the one the clicked
+  // control announced, when the caller passed it. Deriving it again here would
+  // use ascending element-bearing keys, which stop matching the header as soon
+  // as an audio group reorders the rows and inserts an anchor: the same click
+  // then said "Mute track 2" and recorded "Mute track 1".
+  const suffix = trackDisplaySuffix(
+    displayNumber ?? trackDisplayNumber(timelineTrackOrder(timelineElements), track),
+  );
+  const trackElements = timelineElements.filter((element) => element.track === track);
+  const isAudioOnlyTrack = trackElements.length > 0 && trackElements.every(isAudioTimelineElement);
+  const label = isAudioOnlyTrack
+    ? hidden
+      ? `Mute track${suffix}`
+      : `Unmute track${suffix}`
+    : hidden
+      ? `Hide track${suffix}`
+      : `Show track${suffix}`;
   return setElementsHidden({
     projectId,
     activeCompPath,
-    elements: timelineElements.filter((element) => element.track === track),
+    elements: trackElements,
     hidden,
-    label: hidden ? `Hide track ${track}` : `Show track ${track}`,
+    label,
     previewIframe,
     writeProjectFile,
     recordEdit,
-    domEditSaveTimestampRef,
     pendingTimelineEditPathRef,
   });
 }
@@ -229,20 +252,26 @@ export async function toggleTimelineElementHidden({
   previewIframe,
   writeProjectFile,
   recordEdit,
-  domEditSaveTimestampRef,
   pendingTimelineEditPathRef,
 }: ToggleTimelineElementHiddenInput): Promise<string[]> {
-  const element = timelineElements.find((item) => (item.key ?? item.id) === elementKey);
+  const keys = new Set(typeof elementKey === "string" ? [elementKey] : elementKey);
+  const elements = timelineElements.filter((item) => keys.has(item.key ?? item.id));
   return setElementsHidden({
     projectId,
     activeCompPath,
-    elements: element ? [element] : [],
+    elements,
     hidden,
-    label: hidden ? "Hide element" : "Show element",
+    label:
+      elements.length > 1
+        ? hidden
+          ? `Hide ${elements.length} elements`
+          : `Show ${elements.length} elements`
+        : hidden
+          ? "Hide element"
+          : "Show element",
     previewIframe,
     writeProjectFile,
     recordEdit,
-    domEditSaveTimestampRef,
     pendingTimelineEditPathRef,
   });
 }
@@ -253,19 +282,22 @@ export function useTimelineTrackVisibilityEditing({
   showToast,
   writeProjectFile,
   recordEdit,
-  domEditSaveTimestampRef,
   previewIframeRef,
   pendingTimelineEditPathRef,
   isRecordingRef,
   forceReloadSdkSession,
-}: UseTimelineTrackVisibilityEditingInput): (track: number, hidden: boolean) => Promise<void> {
+}: UseTimelineTrackVisibilityEditingInput): (
+  track: number,
+  hidden: boolean,
+  displayNumber?: number | null,
+) => Promise<void> {
   // Resolve the eye toggle against the EXPANDED rows the canvas actually renders:
   // virtual sub-comp children carry their own (display.track + idx) track numbers,
   // so filtering the raw store list by a virtual track number would hide the wrong
   // outer-scene sibling sharing that index.
   const expandedElements = useExpandedTimelineElements();
   return useCallback(
-    async (track: number, hidden: boolean) => {
+    async (track: number, hidden: boolean, displayNumber?: number | null) => {
       if (isRecordingRef?.current) {
         showToast("Cannot edit timeline while recording", "error");
         return;
@@ -279,10 +311,10 @@ export function useTimelineTrackVisibilityEditing({
           timelineElements: expandedElements,
           track,
           hidden,
+          displayNumber,
           previewIframe: previewIframeRef.current,
           writeProjectFile,
           recordEdit,
-          domEditSaveTimestampRef,
           pendingTimelineEditPathRef,
         });
         forceReloadSdkSession?.();
@@ -299,7 +331,6 @@ export function useTimelineTrackVisibilityEditing({
       previewIframeRef,
       writeProjectFile,
       recordEdit,
-      domEditSaveTimestampRef,
       pendingTimelineEditPathRef,
       isRecordingRef,
       showToast,
@@ -312,21 +343,28 @@ export function useTimelineTrackVisibilityEditing({
 export function useTimelineElementVisibilityEditing({
   projectIdRef,
   activeCompPath,
-  timelineElements,
   showToast,
   writeProjectFile,
   recordEdit,
-  domEditSaveTimestampRef,
   previewIframeRef,
   pendingTimelineEditPathRef,
   isRecordingRef,
   forceReloadSdkSession,
 }: UseTimelineElementVisibilityEditingInput): (
-  elementKey: string,
+  elementKey: string | readonly string[],
   hidden: boolean,
 ) => Promise<void> {
+  // Resolve against the EXPANDED rows, not the raw store list — a nested
+  // sub-composition child has no entry of its own in the raw list (only its
+  // host does), so an elementKey for such a child (the
+  // `sourceFile#domId`-shaped virtual key `resolveTimelineIdForSelection`
+  // falls back to) would never match anything there and Hide All would
+  // silently no-op for it. The expanded list synthesizes a real, patchable
+  // TimelineElement (with matching key/domId/sourceFile) for each visible
+  // child whenever its host is currently expanded.
+  const expandedElements = useExpandedTimelineElements();
   return useCallback(
-    async (elementKey: string, hidden: boolean) => {
+    async (elementKey: string | readonly string[], hidden: boolean) => {
       if (isRecordingRef?.current) {
         showToast("Cannot edit timeline while recording", "error");
         return;
@@ -337,13 +375,12 @@ export function useTimelineElementVisibilityEditing({
         await toggleTimelineElementHidden({
           projectId: pid,
           activeCompPath,
-          timelineElements,
+          timelineElements: expandedElements,
           elementKey,
           hidden,
           previewIframe: previewIframeRef.current,
           writeProjectFile,
           recordEdit,
-          domEditSaveTimestampRef,
           pendingTimelineEditPathRef,
         });
         forceReloadSdkSession?.();
@@ -356,11 +393,10 @@ export function useTimelineElementVisibilityEditing({
     },
     [
       activeCompPath,
-      timelineElements,
+      expandedElements,
       previewIframeRef,
       writeProjectFile,
       recordEdit,
-      domEditSaveTimestampRef,
       pendingTimelineEditPathRef,
       isRecordingRef,
       showToast,

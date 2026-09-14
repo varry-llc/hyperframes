@@ -1,8 +1,15 @@
 // fallow-ignore-file code-duplication
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parseToolVersion, runEnvironmentChecks } from "./preflight.js";
+import { checkDisk, parseToolVersion, runEnvironmentChecks } from "./preflight.js";
 import * as manager from "./manager.js";
 import * as linuxDeps from "./linuxDeps.js";
+
+const execFileSync = vi.hoisted(() => vi.fn());
+
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
+  execFileSync,
+}));
 
 describe("runEnvironmentChecks", () => {
   const originalFfmpegPath = process.env.HYPERFRAMES_FFMPEG_PATH;
@@ -11,6 +18,7 @@ describe("runEnvironmentChecks", () => {
   beforeEach(() => {
     process.env.HYPERFRAMES_FFMPEG_PATH = process.execPath;
     process.env.HYPERFRAMES_FFPROBE_PATH = process.execPath;
+    execFileSync.mockReturnValue("ffmpeg version 7.1.1\n");
   });
 
   afterEach(() => {
@@ -27,6 +35,10 @@ describe("runEnvironmentChecks", () => {
     expect(result.outcomes.find((outcome) => outcome.name === "FFprobe")?.ok).toBe(true);
     expect(result.ffmpegPath).toBe(process.execPath);
     expect(result.ffprobePath).toBe(process.execPath);
+    expect(execFileSync).toHaveBeenCalledTimes(2);
+    for (const call of execFileSync.mock.calls) {
+      expect(call[2]).toEqual(expect.objectContaining({ windowsHide: true }));
+    }
   });
 
   it("reports ffprobe as a render-blocking error when the explicit path is missing", async () => {
@@ -55,6 +67,29 @@ describe("runEnvironmentChecks", () => {
       ok: false,
       detail: 'Configured path does not exist: HYPERFRAMES_FFMPEG_PATH="/missing/ffmpeg.exe"',
     });
+  });
+
+  it("blocks rendering when the selected FFmpeg binary cannot launch", async () => {
+    execFileSync.mockImplementation((binaryPath: string) => {
+      if (binaryPath !== process.env.HYPERFRAMES_FFMPEG_PATH) return "ffprobe version 7.1.1\n";
+      throw Object.assign(new Error("Command failed with exit code 3221225781"), {
+        status: 3221225781,
+      });
+    });
+
+    const result = await runEnvironmentChecks();
+    const ffmpeg = result.outcomes.find((outcome) => outcome.name === "FFmpeg");
+
+    expect(ffmpeg).toMatchObject({
+      ok: false,
+      level: "error",
+      title: "FFmpeg cannot start",
+      path: process.execPath,
+    });
+    expect(ffmpeg?.detail).toContain(process.execPath);
+    expect(ffmpeg?.detail).toContain("3221225781");
+    expect(ffmpeg?.hint).toContain("working 64-bit FFmpeg build");
+    expect(result.ffmpegPath).toBeUndefined();
   });
 
   it("validates an explicit browser path without needing browser discovery", async () => {
@@ -87,6 +122,41 @@ describe("runEnvironmentChecks", () => {
       expect(result.browser).toBeUndefined();
     } finally {
       spy.mockRestore();
+    }
+  });
+
+  it.each([
+    { failure: { status: 133, signal: "SIGTRAP" }, detail: "SIGTRAP" },
+    { failure: { code: "EACCES" }, detail: "EACCES" },
+    { failure: { code: "ETIMEDOUT", signal: "SIGKILL" }, detail: "ETIMEDOUT" },
+  ])("rejects an existing browser that fails --version: $detail", async ({ failure, detail }) => {
+    execFileSync.mockImplementation((_path, args) => {
+      if (args[0] === "--version") throw Object.assign(new Error("cannot execute"), failure);
+      return "ffmpeg version 7.1.1\n";
+    });
+    const findBrowser = vi.spyOn(manager, "findBrowser").mockResolvedValue({
+      executablePath: process.execPath,
+      source: "cache",
+    });
+    try {
+      for (const browserPath of [undefined, process.execPath]) {
+        const result = await runEnvironmentChecks({ includeBrowser: true, browserPath });
+        const chrome = result.outcomes.find((outcome) => outcome.name === "Chrome");
+        expect(chrome).toMatchObject({ ok: false, level: "error", title: "Chrome cannot start" });
+        expect(chrome?.detail).toContain(detail);
+        expect(result.browser).toBeUndefined();
+      }
+      expect(execFileSync).toHaveBeenCalledWith(
+        process.execPath,
+        ["--version"],
+        expect.objectContaining({
+          timeout: 5000,
+          killSignal: "SIGKILL",
+          windowsHide: true,
+        }),
+      );
+    } finally {
+      findBrowser.mockRestore();
     }
   });
 
@@ -185,5 +255,17 @@ describe("parseToolVersion", () => {
     expect(parseToolVersion("ffprobe version 7.1.1-essentials_build-www.gyan.dev Copyright")).toBe(
       "ffprobe 7.1.1-essentials_build-www.gyan.dev",
     );
+  });
+});
+
+describe("checkDisk", () => {
+  it("checks the requested render volume", () => {
+    const freeDiskMb = vi.fn(() => 512);
+
+    expect(checkDisk("/external/render-output", freeDiskMb)).toMatchObject({
+      ok: false,
+      detail: "0.5 GB free at /external/render-output",
+    });
+    expect(freeDiskMb).toHaveBeenCalledWith("/external/render-output");
   });
 });

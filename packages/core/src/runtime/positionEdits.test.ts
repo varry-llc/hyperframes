@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   EDIT_BASE_X_ATTR,
   EDIT_BASE_Y_ATTR,
@@ -6,6 +6,7 @@ import {
   applyPositionEditToElement,
   applyPositionEdits,
   composeTranslate,
+  installPositionEditsSeekReapply,
 } from "./positionEdits";
 
 function makeElement(attrs: Record<string, string>, style = ""): HTMLElement {
@@ -55,6 +56,20 @@ describe("applyPositionEdits", () => {
     expect(applyPositionEdits(document)).toBe(1);
     expect(el.style.getPropertyValue("translate")).toBe("50px -50px");
     expect(el.getAttribute(EDIT_ORIGINAL_TRANSLATE_ATTR)).toBe("");
+    el.remove();
+  });
+
+  it("applies the delta to an SVG element (e.g. an authored <text> label), not just HTML", () => {
+    // SVG graphics are positioned via the same CSS `translate` longhand; the old HTML-only guard
+    // silently dropped SVG moves. Regression guard: an SVG <text> must be counted AND translated.
+    const el = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    el.setAttribute("data-x", "145");
+    el.setAttribute("data-y", "1");
+    el.setAttribute(EDIT_BASE_X_ATTR, "0");
+    el.setAttribute(EDIT_BASE_Y_ATTR, "0");
+    document.body.appendChild(el);
+    expect(applyPositionEdits(document)).toBe(1);
+    expect(el.style.getPropertyValue("translate")).toBe("145px 1px");
     el.remove();
   });
 
@@ -171,6 +186,164 @@ describe("applyPositionEdits", () => {
     el.setAttribute("data-x", "30");
     applyPositionEditToElement(el, { force: true });
     expect(el.style.getPropertyValue("translate")).toBe("30px 20px");
+    el.remove();
+  });
+});
+
+describe("installPositionEditsSeekReapply", () => {
+  it("wraps __player.renderSeek so each call reapplies position edits", () => {
+    const el = makeElement({ "data-x": "10", "data-y": "0", "data-hf-edit-base-x": "0" });
+    const calls: number[] = [];
+    // @ts-expect-error test global
+    window.__player = { renderSeek: (time: number) => calls.push(time) };
+
+    installPositionEditsSeekReapply(window as Window & typeof globalThis);
+    // @ts-expect-error test global
+    window.__player.renderSeek(1.5);
+
+    expect(calls).toEqual([1.5]);
+    expect(el.style.getPropertyValue("translate")).toBe("10px 0px");
+    // @ts-expect-error test global
+    delete window.__player;
+    el.remove();
+  });
+
+  it("is idempotent when installed twice", () => {
+    const el = makeElement({ "data-x": "5", "data-y": "0", "data-hf-edit-base-x": "0" });
+    const calls: number[] = [];
+    // @ts-expect-error test global
+    window.__player = { renderSeek: (time: number) => calls.push(time) };
+
+    installPositionEditsSeekReapply(window as Window & typeof globalThis);
+    installPositionEditsSeekReapply(window as Window & typeof globalThis);
+    // @ts-expect-error test global
+    window.__player.renderSeek(2);
+
+    expect(calls).toEqual([2]);
+    // @ts-expect-error test global
+    delete window.__player;
+    el.remove();
+  });
+
+  it("wraps __hf.seek and a seek function assigned after installation", () => {
+    vi.useFakeTimers();
+    const el = makeElement({ "data-x": "8", "data-y": "0", "data-hf-edit-base-x": "0" });
+    const calls: number[] = [];
+    // @ts-expect-error test global
+    window.__hf = {};
+
+    installPositionEditsSeekReapply(window as Window & typeof globalThis);
+    // @ts-expect-error test global
+    window.__hf.seek = (time: number) => calls.push(time);
+    vi.advanceTimersByTime(50);
+    // @ts-expect-error test global
+    window.__hf.seek(3);
+
+    expect(calls).toEqual([3]);
+    expect(el.style.getPropertyValue("translate")).toBe("8px 0px");
+    // @ts-expect-error test global
+    delete window.__hf;
+    el.remove();
+    vi.useRealTimers();
+  });
+
+  it("does not throw when neither seek global exists", () => {
+    expect(() =>
+      installPositionEditsSeekReapply(window as Window & typeof globalThis),
+    ).not.toThrow();
+  });
+});
+
+describe("applyPositionEdits — force option", () => {
+  it("skips a clobbered translate non-forced, re-applies with force", () => {
+    const el = makeElement({
+      "data-x": "10",
+      "data-y": "0",
+      [EDIT_BASE_X_ATTR]: "0",
+      [EDIT_BASE_Y_ATTR]: "0",
+    });
+    applyPositionEdits(document);
+    expect(el.style.getPropertyValue("translate")).toBe("10px 0px");
+
+    // External clobber (GSAP folding it into a cached transform, a draft
+    // write, …) — the non-forced fold-guard must skip, force must overwrite.
+    el.style.setProperty("translate", "999px 0px");
+    applyPositionEdits(document);
+    expect(el.style.getPropertyValue("translate")).toBe("999px 0px");
+
+    applyPositionEdits(document, { force: true });
+    expect(el.style.getPropertyValue("translate")).toBe("10px 0px");
+    el.remove();
+  });
+});
+
+describe("applyPositionEdits — reset path", () => {
+  it("restores the captured pre-edit translate when base attrs were removed (undo)", () => {
+    const el = makeElement(
+      {
+        "data-x": "10",
+        "data-y": "5",
+        [EDIT_BASE_X_ATTR]: "0",
+        [EDIT_BASE_Y_ATTR]: "0",
+      },
+      "translate: 3px 4px",
+    );
+    applyPositionEdits(document);
+    expect(el.style.getPropertyValue("translate")).toBe("13px 9px");
+    expect(el.getAttribute(EDIT_ORIGINAL_TRANSLATE_ATTR)).toBe("3px 4px");
+
+    // Undo: the host removes the whole edit channel.
+    el.removeAttribute("data-x");
+    el.removeAttribute("data-y");
+    el.removeAttribute(EDIT_BASE_X_ATTR);
+    el.removeAttribute(EDIT_BASE_Y_ATTR);
+    applyPositionEdits(document);
+    expect(el.style.getPropertyValue("translate")).toBe("3px 4px");
+    expect(el.hasAttribute(EDIT_ORIGINAL_TRANSLATE_ATTR)).toBe(false);
+    el.remove();
+  });
+
+  it("removes the inline translate entirely when the captured original was none", () => {
+    const el = makeElement({
+      "data-x": "10",
+      "data-y": "0",
+      [EDIT_BASE_X_ATTR]: "0",
+      [EDIT_BASE_Y_ATTR]: "0",
+    });
+    applyPositionEdits(document);
+    expect(el.style.getPropertyValue("translate")).toBe("10px 0px");
+
+    el.removeAttribute("data-x");
+    el.removeAttribute("data-y");
+    el.removeAttribute(EDIT_BASE_X_ATTR);
+    el.removeAttribute(EDIT_BASE_Y_ATTR);
+    applyPositionEdits(document);
+    expect(el.style.getPropertyValue("translate")).toBe("");
+    expect(el.hasAttribute(EDIT_ORIGINAL_TRANSLATE_ATTR)).toBe(false);
+    el.remove();
+  });
+
+  it("a redo after reset re-captures a clean baseline", () => {
+    const el = makeElement({
+      "data-x": "10",
+      "data-y": "0",
+      [EDIT_BASE_X_ATTR]: "0",
+      [EDIT_BASE_Y_ATTR]: "0",
+    });
+    applyPositionEdits(document);
+    el.removeAttribute("data-x");
+    el.removeAttribute("data-y");
+    el.removeAttribute(EDIT_BASE_X_ATTR);
+    el.removeAttribute(EDIT_BASE_Y_ATTR);
+    applyPositionEdits(document); // reset
+
+    // Redo: the host restores the edit channel with a new position.
+    el.setAttribute("data-x", "20");
+    el.setAttribute("data-y", "0");
+    el.setAttribute(EDIT_BASE_X_ATTR, "0");
+    el.setAttribute(EDIT_BASE_Y_ATTR, "0");
+    applyPositionEdits(document, { force: true });
+    expect(el.style.getPropertyValue("translate")).toBe("20px 0px");
     el.remove();
   });
 });

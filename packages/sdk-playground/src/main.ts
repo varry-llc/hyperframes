@@ -256,7 +256,7 @@ const TRACK_COLORS = ["#3b82f6", "#8b5cf6", "#f59e0b", "#10b981", "#f87171", "#0
 
 function selectorToHfId(selector: string): string | null {
   const m = /\[data-hf-id=['"]([^'"]+)['"]\]/.exec(selector);
-  if (m) return m[1];
+  if (m) return m[1] ?? null;
   if (/^#/.test(selector.trim())) return selector.trim().slice(1);
   return null;
 }
@@ -347,7 +347,7 @@ function buildTrackRow(
   index: number,
   dur: number,
 ): HTMLDivElement {
-  const color = TRACK_COLORS[index % TRACK_COLORS.length];
+  const color = TRACK_COLORS[index % TRACK_COLORS.length] ?? "#3b82f6";
   const row = document.createElement("div");
   row.className = "tl-row";
   const labelEl = document.createElement("div");
@@ -1357,7 +1357,11 @@ const MSG_HANDLERS: Record<string, (data: any) => void> = {
 };
 
 function onWindowMessage(e: MessageEvent) {
-  const handler = e.data && MSG_HANDLERS[e.data.type];
+  const frame = getFrame()?.contentWindow;
+  if (!frame || e.source !== frame) return;
+  const type = e.data?.type;
+  if (typeof type !== "string" || !Object.hasOwn(MSG_HANDLERS, type)) return;
+  const handler = MSG_HANDLERS[type];
   if (handler) handler(e.data);
 }
 
@@ -1462,5 +1466,9 @@ async function init() {
 }
 
 init().catch((err) => {
-  document.body.innerHTML = `<pre style="color:#f87171;padding:20px">${String(err)}</pre>`;
+  const message = document.createElement("pre");
+  message.style.color = "#f87171";
+  message.style.padding = "20px";
+  message.textContent = String(err);
+  document.body.replaceChildren(message);
 });

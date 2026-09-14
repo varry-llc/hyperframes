@@ -19,16 +19,83 @@ function createMockDeps() {
     onSetRootDuration: vi.fn(),
     onEnablePickMode: vi.fn(),
     onDisablePickMode: vi.fn(),
+    onSetRuntimeData: vi.fn(),
+    onClearRuntimeData: vi.fn(),
+    getCanonicalFps: vi.fn(() => 30),
   };
 }
 
 function makeControlMessage(action: string, extra?: Record<string, unknown>) {
   return new MessageEvent("message", {
+    source: window.parent,
     data: { source: "hf-parent", type: "control", action, ...extra },
   });
 }
 
 describe("installRuntimeControlBridge", () => {
+  it("ignores inherited and unknown action names from an authorized sender", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    try {
+      for (const action of [
+        "__proto__",
+        "constructor",
+        "hasOwnProperty",
+        "__defineGetter__",
+        "toString",
+        "unknown",
+      ]) {
+        expect(() => handler(makeControlMessage(action))).not.toThrow();
+      }
+      expect(deps.onPlay).not.toHaveBeenCalled();
+      handler(makeControlMessage("play"));
+      expect(deps.onPlay).toHaveBeenCalledOnce();
+    } finally {
+      window.removeEventListener("message", handler);
+    }
+  });
+  it("rejects foreign and null senders before dispatching controls", () => {
+    const foreign = document.createElement("iframe");
+    document.body.append(foreign);
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    try {
+      for (const source of [foreign.contentWindow, null]) {
+        handler(
+          new MessageEvent("message", {
+            source,
+            data: { source: "hf-parent", type: "control", action: "play" },
+          }),
+        );
+      }
+      expect(deps.onPlay).not.toHaveBeenCalled();
+      handler(
+        new MessageEvent("message", {
+          source: window,
+          data: { source: "hf-parent", type: "control", action: "play" },
+        }),
+      );
+      expect(deps.onPlay).toHaveBeenCalledOnce();
+    } finally {
+      window.removeEventListener("message", handler);
+      foreign.remove();
+    }
+  });
+  it("accepts an embedding parent distinct from the runtime window", () => {
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    vi.stubGlobal("parent", frame.contentWindow);
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    try {
+      handler(makeControlMessage("play"));
+      expect(deps.onPlay).toHaveBeenCalledOnce();
+    } finally {
+      window.removeEventListener("message", handler);
+      vi.unstubAllGlobals();
+      frame.remove();
+    }
+  });
   it("dispatches play command", () => {
     const deps = createMockDeps();
     const handler = installRuntimeControlBridge(deps);
@@ -43,6 +110,18 @@ describe("installRuntimeControlBridge", () => {
     expect(deps.onPause).toHaveBeenCalledOnce();
   });
 
+  it("dispatches set and clear runtime data without global invocation", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    const payload = { version: 3, segments: [] };
+    handler(
+      makeControlMessage("set-runtime-data", { channel: "captions", payload, requestId: 41 }),
+    );
+    handler(makeControlMessage("clear-runtime-data", { channel: "captions", requestId: 42 }));
+    expect(deps.onSetRuntimeData).toHaveBeenCalledWith("captions", payload, 41);
+    expect(deps.onClearRuntimeData).toHaveBeenCalledWith("captions", 42);
+  });
+
   it("dispatches stop-media command", () => {
     const deps = createMockDeps();
     const handler = installRuntimeControlBridge(deps);
@@ -54,7 +133,22 @@ describe("installRuntimeControlBridge", () => {
     const deps = createMockDeps();
     const handler = installRuntimeControlBridge(deps);
     handler(makeControlMessage("seek", { frame: 150, seekMode: "drag" }));
-    expect(deps.onSeek).toHaveBeenCalledWith(150, "drag");
+    expect(deps.onSeek).toHaveBeenCalledWith(5, "drag");
+  });
+
+  it("prefers canonical seconds in protocol v1 seek messages", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    handler(
+      makeControlMessage("seek", {
+        protocolVersion: 1,
+        capabilities: ["seconds-time", "rational-fps", "seek-keep-playing"],
+        fps: { numerator: 60, denominator: 1 },
+        timeSeconds: 2.5,
+        frame: 999,
+      }),
+    );
+    expect(deps.onSeek).toHaveBeenCalledWith(2.5, "commit");
   });
 
   it("seek defaults frame to 0 and seekMode to commit", () => {
@@ -166,7 +260,7 @@ describe("installRuntimeControlBridge", () => {
   it("dispatches set-color-grading command with target and grading payload", () => {
     const deps = createMockDeps();
     const handler = installRuntimeControlBridge(deps);
-    const grading = { preset: "warm-clean", intensity: 0.7 };
+    const grading = { preset: "warm-daylight", intensity: 0.7 };
     const target = { id: "hero-video", selectorIndex: 0 };
     handler(makeControlMessage("set-color-grading", { target, grading }));
     expect(deps.onSetColorGrading).toHaveBeenCalledWith(target, grading);
@@ -245,7 +339,32 @@ describe("installRuntimeControlBridge", () => {
     const postSpy = vi.spyOn(window.parent, "postMessage");
     const deps = createMockDeps();
     installRuntimeControlBridge(deps);
-    expect(postSpy).toHaveBeenCalledWith({ source: "hf-preview", type: "ready" }, "*");
+    expect(postSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "hf-preview",
+        type: "ready",
+        protocolVersion: 1,
+        fps: { numerator: 30, denominator: 1 },
+      }),
+      "*",
+    );
+    postSpy.mockRestore();
+  });
+
+  it("rejects an unknown protocol major with a diagnostic", () => {
+    const postSpy = vi.spyOn(window.parent, "postMessage");
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    handler(makeControlMessage("play", { protocolVersion: 2 }));
+
+    expect(deps.onPlay).not.toHaveBeenCalled();
+    expect(postSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "diagnostic",
+        code: "runtime.protocol.unsupported_protocol_version",
+      }),
+      "*",
+    );
     postSpy.mockRestore();
   });
 });

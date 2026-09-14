@@ -13,11 +13,14 @@ import {
   groupOverlayItemsEqual,
   isElementVisibleForOverlay,
   groupAwareOverlayRect,
+  orientedGroupAwareOverlayRect,
   rectsEqual,
   resolveElementForOverlay,
   selectionCacheKey,
-  toVisibleOverlayRect,
+  orientedVisibleOverlayRect,
 } from "./domEditOverlayGeometry";
+import { computeOverlayRootScale } from "./domEditOverlayBasis";
+import { subscribeOverlayFrame } from "./overlayFrameLoop";
 
 function childRectsEqual(a: OverlayRect[], b: OverlayRect[]): boolean {
   if (a.length !== b.length) return false;
@@ -105,8 +108,6 @@ export function useDomEditOverlayRects({
   };
 
   useMountEffect(() => {
-    let frame = 0;
-
     const clearAll = () => {
       setOverlayRect(null);
       setHoverRect(null);
@@ -114,7 +115,6 @@ export function useDomEditOverlayRects({
     };
 
     const update = () => {
-      frame = requestAnimationFrame(update);
       if (rafPausedRef.current) {
         if (childRectsRef.current.length > 0) {
           childRectsRef.current = [];
@@ -143,6 +143,14 @@ export function useDomEditOverlayRects({
         return;
       }
 
+      // One basis for the whole frame: the selection box, up to 60 child
+      // outlines, every group box and the hover box all map through the same
+      // iframe→overlay transform, and nothing below writes to the preview DOM
+      // or moves the canvas. Resolved per call it was one
+      // `querySelector("[data-composition-id]")` and three layout reads EACH,
+      // every frame.
+      const scale = computeOverlayRootScale(overlayEl, iframe, doc);
+
       if (sel) {
         const el = resolveElementForOverlay(
           doc,
@@ -157,7 +165,13 @@ export function useDomEditOverlayRects({
         // backgroundless full-bleed scene above a subcomposition), which would wrongly
         // hide the selection box. Occlusion stays for hover, where a false hide is cheap.
         if (el && isElementVisibleForOverlay(el)) {
-          const nextRect = groupAwareOverlayRect(overlayEl, iframe, el);
+          // Groups render as an AABB union of their members (a group OBB is out of
+          // scope); a single element renders as an oriented box that co-rotates
+          // with its transform. orientedOverlayRect gates on rotation internally
+          // (a cheap per-call check) and only pays for the full corner-transform
+          // measurement when the element is actually rotated — this RAF loop runs
+          // every frame for any single selection, so that gate matters here most.
+          const nextRect = orientedGroupAwareOverlayRect(overlayEl, iframe, el, scale);
           setOverlayRect(nextRect);
           const descendants = el.querySelectorAll("*");
           if (descendants.length > 0 && descendants.length <= 60) {
@@ -165,7 +179,9 @@ export function useDomEditOverlayRects({
             for (let i = 0; i < descendants.length; i++) {
               const child = descendants[i] as HTMLElement;
               if (!child.getBoundingClientRect) continue;
-              const r = toVisibleOverlayRect(overlayEl, iframe, child);
+              // Oriented, not axis-aligned: a child of a rotated element drew its
+              // outline square around the rotated glyphs instead of on them.
+              const r = orientedVisibleOverlayRect(overlayEl, iframe, child, scale);
               if (r && r.width > 2 && r.height > 2) nextChildRects.push(r);
             }
             if (!childRectsEqual(childRectsRef.current, nextChildRects)) {
@@ -204,7 +220,7 @@ export function useDomEditOverlayRects({
           if (liveGroupKeys.has(key)) continue;
           liveGroupKeys.add(key);
           const el = resolveGroupElement(doc, groupSelection);
-          const base = el ? groupAwareOverlayRect(overlayEl, iframe, el) : null;
+          const base = el ? groupAwareOverlayRect(overlayEl, iframe, el, scale) : null;
           const rect = base && el ? { ...base, ...hugRectForElement(base, el) } : base;
           if (el && rect)
             nextGroupItems.push({ key, selection: groupSelection, element: el, rect });
@@ -242,11 +258,10 @@ export function useDomEditOverlayRects({
         return;
       }
 
-      setHoverRect(groupAwareOverlayRect(overlayEl, iframe, hoverEl));
+      setHoverRect(orientedGroupAwareOverlayRect(overlayEl, iframe, hoverEl, scale));
     };
 
-    frame = requestAnimationFrame(update);
-    return () => cancelAnimationFrame(frame);
+    return subscribeOverlayFrame(update);
   });
 
   return {

@@ -8,6 +8,7 @@ import { insertTimelineAssetIntoSource } from "../utils/timelineAssetDrop";
 import { saveProjectFilesWithHistory } from "../utils/studioFileHistory";
 import type { EditHistoryKind } from "../utils/editHistory";
 import { formatTimelineAttributeNumber } from "../player/components/timelineEditing";
+import { findElementForSelection } from "../components/editor/domEditingElement";
 import { readFileContent } from "./timelineEditingHelpers";
 
 interface RecordEditInput {
@@ -24,7 +25,6 @@ interface UseClipboardOptions {
   showToast: (message: string, tone?: "error" | "info") => void;
   writeProjectFile: (path: string, content: string) => Promise<void>;
   recordEdit: (input: RecordEditInput) => Promise<void>;
-  domEditSaveTimestampRef: React.MutableRefObject<number>;
   reloadPreview: () => void;
   handleTimelineElementDelete: (element: TimelineElement) => Promise<void>;
   handleDomEditElementDelete: (selection: DomEditSelection) => Promise<void>;
@@ -34,6 +34,7 @@ interface UseClipboardOptions {
 function getElementOuterHtml(
   iframeRef: React.MutableRefObject<HTMLIFrameElement | null>,
   selection: DomEditSelection,
+  activeCompositionPath: string | null,
 ): string | null {
   let doc: Document | null = null;
   try {
@@ -43,15 +44,7 @@ function getElementOuterHtml(
   }
   if (!doc) return null;
 
-  let el: Element | null = null;
-  if (selection.id) {
-    el = doc.getElementById(selection.id);
-  }
-  if (!el && selection.selector) {
-    const matches = doc.querySelectorAll(selection.selector);
-    el = matches[selection.selectorIndex ?? 0] ?? null;
-  }
-  return el && "outerHTML" in el ? (el as Element).outerHTML : null;
+  return findElementForSelection(doc, selection, activeCompositionPath)?.outerHTML ?? null;
 }
 
 export function useClipboard({
@@ -61,7 +54,6 @@ export function useClipboard({
   showToast,
   writeProjectFile,
   recordEdit,
-  domEditSaveTimestampRef,
   reloadPreview,
   handleTimelineElementDelete,
   handleDomEditElementDelete,
@@ -71,6 +63,9 @@ export function useClipboard({
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
 
+  // The copy-mode branches predate this change; this diff only replaces its
+  // duplicated DOM lookup with the canonical composition-aware resolver.
+  // fallow-ignore-next-line complexity
   const handleCopy = useCallback((): boolean => {
     const { selectedElementId, elements } = usePlayerStore.getState();
 
@@ -84,13 +79,18 @@ export function useClipboard({
       try {
         const doc = previewIframeRef.current?.contentDocument;
         if (doc) {
-          let el: Element | null = null;
-          if (element.domId) el = doc.getElementById(element.domId);
-          if (!el && element.selector) {
-            const matches = doc.querySelectorAll(element.selector);
-            el = matches[element.selectorIndex ?? 0] ?? null;
-          }
-          if (el && "outerHTML" in el) html = (el as Element).outerHTML;
+          html =
+            findElementForSelection(
+              doc,
+              {
+                hfId: element.hfId,
+                id: element.domId,
+                selector: element.selector,
+                selectorIndex: element.selectorIndex,
+                sourceFile: targetPath,
+              },
+              activeCompPath,
+            )?.outerHTML ?? null;
         }
       } catch {
         // cross-origin frame
@@ -110,7 +110,7 @@ export function useClipboard({
     // DOM element copy
     const domSelection = domEditSelectionRef.current;
     if (domSelection) {
-      const html = getElementOuterHtml(previewIframeRef, domSelection);
+      const html = getElementOuterHtml(previewIframeRef, domSelection, activeCompPath);
       if (!html) {
         showToast("Unable to copy this element.", "info");
         return false;
@@ -169,7 +169,6 @@ export function useClipboard({
         );
       }
 
-      domEditSaveTimestampRef.current = Date.now();
       await saveProjectFilesWithHistory({
         projectId: pid,
         label: payload.kind === "timeline-clip" ? "Paste clip" : "Paste element",
@@ -186,14 +185,7 @@ export function useClipboard({
       const message = error instanceof Error ? error.message : "Failed to paste";
       showToast(message);
     }
-  }, [
-    activeCompPath,
-    domEditSaveTimestampRef,
-    recordEdit,
-    reloadPreview,
-    showToast,
-    writeProjectFile,
-  ]);
+  }, [activeCompPath, recordEdit, reloadPreview, showToast, writeProjectFile]);
 
   const handleCut = useCallback(async (): Promise<boolean> => {
     const copied = handleCopy();

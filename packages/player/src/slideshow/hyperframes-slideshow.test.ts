@@ -1,7 +1,11 @@
 // fallow-ignore-file code-duplication
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { handleRuntimeMessage } from "../runtime-message-handler.js";
-import { dropInvalidSlides } from "./hyperframes-slideshow.js";
+import {
+  childrenMayStillArrive,
+  dropInvalidSlides,
+  locateSlideshowParts,
+} from "./hyperframes-slideshow.js";
 import { slideshowChannelName } from "./slideshowPresenter.js";
 
 // Dynamic import defers custom-element registration until happy-dom is active.
@@ -195,6 +199,30 @@ describe("<hyperframes-slideshow>", () => {
     el.remove();
   });
 
+  it("accepts embedding-parent and self navigation but rejects other senders", () => {
+    const onNext = vi.fn();
+    const el = makeEl({ onNext });
+    const embedding = document.createElement("iframe");
+    const foreign = document.createElement("iframe");
+    document.body.append(embedding, foreign);
+    vi.stubGlobal("parent", embedding.contentWindow);
+    try {
+      for (const source of [foreign.contentWindow, null]) {
+        window.dispatchEvent(new MessageEvent("message", { source, data: { type: "next" } }));
+      }
+      expect(onNext).not.toHaveBeenCalled();
+      for (const source of [window, embedding.contentWindow]) {
+        window.dispatchEvent(new MessageEvent("message", { source, data: { type: "next" } }));
+      }
+      expect(onNext).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.unstubAllGlobals();
+      embedding.remove();
+      foreign.remove();
+      el.remove();
+    }
+  });
+
   it("handles postMessage next", () => {
     const el = document.createElement("hyperframes-slideshow") as any;
     document.body.appendChild(el);
@@ -211,7 +239,7 @@ describe("<hyperframes-slideshow>", () => {
       currentSlide: { hotspots: [] },
       nextSlide: null,
     });
-    window.dispatchEvent(new MessageEvent("message", { data: { type: "next" } }));
+    window.dispatchEvent(new MessageEvent("message", { source: window, data: { type: "next" } }));
     expect(nextCalled).toBe(true);
     el.remove();
   });
@@ -394,35 +422,70 @@ describe("<hyperframes-slideshow>", () => {
     el.remove();
   });
 
-  it("mute button applies globally to child players and page media", () => {
-    const el = document.createElement("hyperframes-slideshow") as any;
-    el.setAttribute("sound", "");
-    const player = document.createElement("hyperframes-player") as any;
-    player.muted = false;
-    el.appendChild(player);
+  it("mute and stopMedia affect only media owned by that slideshow", () => {
+    const bind = (el: any) => {
+      el.__setControllerForTest({
+        next: () => {},
+        prev: () => {},
+        onChange: () => () => {},
+        counter: { index: 1, total: 1 },
+        breadcrumb: [{ id: "main", label: "Main deck" }],
+        currentSlide: { hotspots: [] },
+        nextSlide: null,
+      });
+    };
+    const attachPlayerMedia = (slideshow: HTMLElement, id: string) => {
+      const player = document.createElement("hyperframes-player") as any;
+      player.id = id;
+      player.muted = false;
+      const frame = document.createElement("iframe");
+      document.body.appendChild(frame);
+      const frameDoc = frame.contentDocument!;
+      const video = frameDoc.createElement("video");
+      video.id = `${id}-video`;
+      video.pause = vi.fn();
+      frameDoc.body.appendChild(video);
+      Object.defineProperty(player, "iframeElement", { configurable: true, value: frame });
+      slideshow.appendChild(player);
+      return { player, frame, video };
+    };
+
+    const slideshowA = document.createElement("hyperframes-slideshow") as any;
+    const slideshowB = document.createElement("hyperframes-slideshow") as any;
+    slideshowA.setAttribute("sound", "");
+    slideshowB.setAttribute("sound", "");
+    const ownedA = attachPlayerMedia(slideshowA, "a");
+    const ownedB = attachPlayerMedia(slideshowB, "b");
     const pageVideo = document.createElement("video");
-    document.body.append(pageVideo, el);
-    el.__setControllerForTest({
-      next: () => {},
-      prev: () => {},
-      onChange: () => () => {},
-      counter: { index: 1, total: 1 },
-      breadcrumb: [{ id: "main", label: "Main deck" }],
-      currentSlide: { hotspots: [] },
-      nextSlide: null,
-    });
+    pageVideo.pause = vi.fn();
+    document.body.append(pageVideo, slideshowA, slideshowB);
+    bind(slideshowA);
+    bind(slideshowB);
 
-    const muteBtn = el.querySelector("[data-hf-mute]") as HTMLElement;
+    const muteBtn = slideshowA.querySelector("[data-hf-mute]") as HTMLElement;
     muteBtn.click();
-    expect(player.muted).toBe(true);
-    expect(pageVideo.muted).toBe(true);
-
-    const muteBtnAfter = el.querySelector("[data-hf-mute]") as HTMLElement;
-    muteBtnAfter.click();
-    expect(player.muted).toBe(false);
+    expect(ownedA.player.muted).toBe(true);
+    expect(ownedA.video.muted).toBe(true);
+    expect(ownedB.player.muted).toBe(false);
+    expect(ownedB.video.muted).toBe(false);
     expect(pageVideo.muted).toBe(false);
 
-    el.remove();
+    const muteBtnAfter = slideshowA.querySelector("[data-hf-mute]") as HTMLElement;
+    muteBtnAfter.click();
+    expect(ownedA.player.muted).toBe(false);
+    expect(ownedA.video.muted).toBe(false);
+    expect(ownedB.video.muted).toBe(false);
+    expect(pageVideo.muted).toBe(false);
+
+    slideshowA.stopDocumentMedia();
+    expect(ownedA.video.pause).toHaveBeenCalledTimes(1);
+    expect(ownedB.video.pause).not.toHaveBeenCalled();
+    expect(pageVideo.pause).not.toHaveBeenCalled();
+
+    slideshowA.remove();
+    slideshowB.remove();
+    ownedA.frame.remove();
+    ownedB.frame.remove();
     pageVideo.remove();
   });
 
@@ -1526,6 +1589,167 @@ describe("<hyperframes-slideshow> deferred init (Bug 1)", () => {
     await vi.advanceTimersByTimeAsync(3000);
     vi.useRealTimers();
   });
+
+  // The macrotask is not a guarantee: with the bundle loaded from <head>, real
+  // headless Chromium fires it while the parser is still inside the element,
+  // so init sees no player and no island. While the document is loading, init
+  // retries once at DOMContentLoaded, when every parser-inserted child exists.
+  describe("retry at DOMContentLoaded when init ran before the children were parsed", () => {
+    const island = `
+      <script type="application/hyperframes-slideshow+json">
+        { "slides": [ { "sceneId": "intro", "startTime": 0, "endTime": 1 } ] }
+      </script>
+    `;
+
+    function fakePlayer(): HTMLElement {
+      const player = document.createElement("hyperframes-player");
+      Object.defineProperty(player, "ready", { get: () => true });
+      Object.defineProperty(player, "seek", { value: () => {} });
+      Object.defineProperty(player, "play", { value: () => {} });
+      Object.defineProperty(player, "pause", { value: () => {} });
+      Object.defineProperty(player, "currentTime", { get: () => 0 });
+      Object.defineProperty(player, "scenes", { get: () => [] });
+      return player;
+    }
+
+    function setReadyState(state: DocumentReadyState): void {
+      Object.defineProperty(document, "readyState", { value: state, configurable: true });
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      setReadyState("loading");
+    });
+
+    afterEach(() => {
+      setReadyState("complete");
+      vi.useRealTimers();
+    });
+
+    it("binds once DOMContentLoaded fires with the children present", async () => {
+      const el = document.createElement("hyperframes-slideshow");
+      document.body.appendChild(el);
+
+      // The deferred init runs against an empty subtree and finds nothing.
+      await vi.advanceTimersByTimeAsync(10);
+      expect(el.querySelector("[data-hf-chrome]")).toBeNull();
+
+      // The parser catches up, then the document finishes loading.
+      el.innerHTML = island;
+      el.appendChild(fakePlayer());
+      document.dispatchEvent(new Event("DOMContentLoaded"));
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(el.querySelector("[data-hf-chrome]")).toBeTruthy();
+      expect(el.querySelector("[data-hf-counter]")?.textContent).toContain("1");
+
+      el.remove();
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+
+    it("retries when the island was only partly streamed in", async () => {
+      const el = document.createElement("hyperframes-slideshow");
+      el.appendChild(fakePlayer());
+      // What the parser has appended so far: an open island with truncated JSON.
+      el.insertAdjacentHTML(
+        "beforeend",
+        `<script type="application/hyperframes-slideshow+json">{ "slides": [ { "sceneId": "in</script>`,
+      );
+      document.body.appendChild(el);
+
+      await vi.advanceTimersByTimeAsync(10);
+      expect(el.querySelector("[data-hf-chrome]")).toBeNull();
+
+      el.querySelector("script")?.remove();
+      el.insertAdjacentHTML("beforeend", island);
+      document.dispatchEvent(new Event("DOMContentLoaded"));
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(el.querySelector("[data-hf-chrome]")).toBeTruthy();
+
+      el.remove();
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+
+    it("does not retry once the document has finished parsing", async () => {
+      setReadyState("complete");
+      const addListener = vi.spyOn(document, "addEventListener");
+      const el = document.createElement("hyperframes-slideshow");
+      document.body.appendChild(el);
+
+      await vi.advanceTimersByTimeAsync(10);
+
+      const armed = addListener.mock.calls.some(([type]) => type === "DOMContentLoaded");
+      expect(armed).toBe(false);
+      addListener.mockRestore();
+      el.remove();
+    });
+
+    it("drops the retry when the element is disconnected first", async () => {
+      const removeListener = vi.spyOn(document, "removeEventListener");
+      const el = document.createElement("hyperframes-slideshow");
+      document.body.appendChild(el);
+      await vi.advanceTimersByTimeAsync(10);
+
+      el.innerHTML = island;
+      el.appendChild(fakePlayer());
+      el.remove();
+      const dropped = removeListener.mock.calls.some(([type]) => type === "DOMContentLoaded");
+      expect(dropped).toBe(true);
+      removeListener.mockRestore();
+
+      document.dispatchEvent(new Event("DOMContentLoaded"));
+      await vi.advanceTimersByTimeAsync(10);
+      expect(el.querySelector("[data-hf-chrome]")).toBeNull();
+    });
+  });
+});
+
+describe("slideshow parts (pure)", () => {
+  const island = `<script type="application/hyperframes-slideshow+json">
+    { "slides": [ { "sceneId": "intro", "startTime": 0, "endTime": 1 } ] }
+  </script>`;
+
+  function subtree(html: string): Element {
+    const root = document.createElement("div");
+    root.innerHTML = html;
+    return root;
+  }
+
+  it("childrenMayStillArrive is true only while the document is loading", () => {
+    expect(childrenMayStillArrive("loading")).toBe(true);
+    expect(childrenMayStillArrive("interactive")).toBe(false);
+    expect(childrenMayStillArrive("complete")).toBe(false);
+  });
+
+  it("locateSlideshowParts reports what is missing, in the order init needs it", () => {
+    expect(locateSlideshowParts(subtree(""))).toEqual({ kind: "incomplete", reason: "no-player" });
+    expect(locateSlideshowParts(subtree(island))).toEqual({
+      kind: "incomplete",
+      reason: "no-player",
+    });
+    expect(locateSlideshowParts(subtree("<hyperframes-player></hyperframes-player>"))).toEqual({
+      kind: "incomplete",
+      reason: "no-island",
+    });
+    expect(
+      locateSlideshowParts(
+        subtree(
+          `<hyperframes-player></hyperframes-player>` +
+            `<script type="application/hyperframes-slideshow+json">{ "slides": [ {</script>`,
+        ),
+      ),
+    ).toEqual({ kind: "incomplete", reason: "malformed-island" });
+  });
+
+  it("locateSlideshowParts is ready when both the player and the island are there", () => {
+    const root = subtree(`<hyperframes-player></hyperframes-player>${island}`);
+    const parts = locateSlideshowParts(root);
+    expect(parts.kind).toBe("ready");
+    if (parts.kind !== "ready") return;
+    expect(parts.player).toBe(root.querySelector("hyperframes-player"));
+    expect(parts.manifest.slides.map((s) => s.sceneId)).toEqual(["intro"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1781,7 +2005,7 @@ describe("<hyperframes-slideshow> Fix 7 — audience mode ignores window postMes
       currentSlide: { hotspots: [] },
       nextSlide: null,
     });
-    window.dispatchEvent(new MessageEvent("message", { data: { type: "next" } }));
+    window.dispatchEvent(new MessageEvent("message", { source: window, data: { type: "next" } }));
     expect(nextCalled).toBe(false);
     el.remove();
   });
@@ -1803,7 +2027,7 @@ describe("<hyperframes-slideshow> Fix 7 — audience mode ignores window postMes
       currentSlide: { hotspots: [] },
       nextSlide: null,
     });
-    window.dispatchEvent(new MessageEvent("message", { data: { type: "next" } }));
+    window.dispatchEvent(new MessageEvent("message", { source: window, data: { type: "next" } }));
     expect(nextCalled).toBe(true);
     el.remove();
   });
@@ -2274,7 +2498,7 @@ describe("<hyperframes-slideshow> Fix 4 — back affordance (postMessage only; c
         backCalled = true;
       },
     });
-    window.dispatchEvent(new MessageEvent("message", { data: { type: "back" } }));
+    window.dispatchEvent(new MessageEvent("message", { source: window, data: { type: "back" } }));
     expect(backCalled).toBe(true);
     el.remove();
   });
@@ -2288,7 +2512,7 @@ describe("<hyperframes-slideshow> Fix 4 — back affordance (postMessage only; c
       },
     });
     el.setAttribute("mode", "audience");
-    window.dispatchEvent(new MessageEvent("message", { data: { type: "back" } }));
+    window.dispatchEvent(new MessageEvent("message", { source: window, data: { type: "back" } }));
     expect(backCalled).toBe(false);
     el.remove();
   });

@@ -1,3 +1,4 @@
+import type { BrowserGpuMode } from "../browser/gpuPolicy.js";
 import { c } from "./colors.js";
 
 export function formatBytes(bytes: number): string {
@@ -39,6 +40,74 @@ export function formatRenderSummaryDetail(input: {
   return [middle, renderTime].filter(Boolean).join(" · ");
 }
 
+type PipelineStageKey =
+  | "compileMs"
+  | "videoExtractMs"
+  | "audioProcessMs"
+  | "browserProbeMs"
+  | "captureSetupMs"
+  | "captureFrameMs"
+  | "encodeMs"
+  | "assembleMs";
+
+const PIPELINE_STAGES: ReadonlyArray<readonly [PipelineStageKey, string]> = [
+  ["compileMs", "compile"],
+  ["videoExtractMs", "extract"],
+  ["audioProcessMs", "audio"],
+  ["browserProbeMs", "probe"],
+  ["captureSetupMs", "setup"],
+  ["captureFrameMs", "capture"],
+  ["encodeMs", "encode"],
+  ["assembleMs", "assemble"],
+];
+
+/** Session mode wins unless it is the aggregator's empty `"unknown"` sentinel. */
+export function resolvePrintedCaptureMode(
+  sessionMode?: string,
+  observabilityCaptureMode?: string,
+): string | undefined {
+  if (sessionMode && sessionMode !== "unknown") return sessionMode;
+  return observabilityCaptureMode;
+}
+
+/** Capture path, gpu mode, and stage timings for the render summary. */
+export function formatRenderPipelineDetail(input: {
+  captureMode?: string;
+  browserGpuMode?: BrowserGpuMode | string;
+  streamingEncode?: boolean;
+  stages: Record<string, number | undefined>;
+}): string | undefined {
+  const parts: string[] = [];
+  if (input.captureMode) parts.push(`${input.captureMode} capture`);
+  if (input.browserGpuMode) parts.push(`${input.browserGpuMode} gpu`);
+  for (const [key, stageLabel] of PIPELINE_STAGES) {
+    const ms = input.stages[key];
+    if (ms == null) continue;
+    const label =
+      key === "encodeMs" && input.streamingEncode ? "encode (during capture)" : stageLabel;
+    parts.push(`${label} ${formatDuration(ms)}`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+/**
+ * Why a Linux auto render stayed on screenshot after BeginFrame was requested.
+ * Silent when software was requested (--docker, --no-browser-gpu) or off Linux.
+ */
+export function formatScreenshotFallbackHint(input: {
+  captureMode?: string;
+  browserGpuMode?: BrowserGpuMode | string;
+  requestedGpuMode?: BrowserGpuMode;
+  platform: NodeJS.Platform;
+}): string | undefined {
+  if (input.platform !== "linux" || input.requestedGpuMode !== "auto") return undefined;
+  if (input.captureMode !== "screenshot" || input.browserGpuMode !== "software") return undefined;
+  return (
+    "Screenshot capture (slower): BeginFrame did not run. Needs chrome-headless-shell and no " +
+    "--resolution upscale. Heavy compositions can stall on software GL."
+  );
+}
+
 export function label(name: string, value: string): string {
   const pad = 14 - name.length;
   return `   ${c.dim(name)}${" ".repeat(Math.max(1, pad))}${c.bold(value)}`;
@@ -46,7 +115,16 @@ export function label(name: string, value: string): string {
 
 export function errorBox(title: string, hint?: string, suggestion?: string): void {
   console.error(`\n${c.error("\u2717")}  ${c.bold(title)}`);
-  if (hint) console.error(`\n   ${c.dim(hint)}`);
+  if (hint) {
+    // Indent EVERY hint line, not just the first \u2014 a multi-line hint (e.g. the
+    // NO_TOKEN numbered setup list) otherwise had line 1 indented and the rest
+    // flush-left, mangling the list. Single-line hints are unchanged.
+    const indented = hint
+      .split("\n")
+      .map((line) => `   ${line}`)
+      .join("\n");
+    console.error(`\n${c.dim(indented)}`);
+  }
   if (suggestion) console.error(`   ${c.accent(suggestion)}`);
   console.error();
 }

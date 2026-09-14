@@ -1,5 +1,7 @@
 import type { RuntimeJson, RuntimeOutboundMessage, RuntimePickerElementInfo } from "./types";
+import { COLOR_GRADING_SOURCE_HIDDEN_ATTR } from "../colorGrading";
 import { swallow } from "./diagnostics";
+import { isElementNode } from "./domRealm";
 
 type PickerModuleDeps = {
   postMessage: (payload: RuntimeOutboundMessage) => void;
@@ -17,7 +19,6 @@ const PICKER_BLOCK_SELECTOR = [
   "[data-hyperframes-picker-block]",
   "[data-hyper-shader-loading]",
 ].join(",");
-const COLOR_GRADING_SOURCE_HIDDEN_ATTR = "data-hf-color-grading-source-hidden";
 
 export type PickerModule = {
   enablePickMode: () => void;
@@ -95,7 +96,10 @@ export function createPickerModule(deps: PickerModuleDeps): PickerModule {
 
   function buildElementSelector(el: Element): string {
     const htmlEl = el as HTMLElement;
-    if (htmlEl.id) return `#${htmlEl.id}`;
+    // Escape the ID so digit-leading or otherwise CSS-illegal ids (e.g. `#0`,
+    // `#1`) produce valid selectors — `document.querySelector("#0")` throws
+    // SyntaxError per the CSS spec. Sibling branches below already escape.
+    if (htmlEl.id) return `#${CSS.escape(htmlEl.id)}`;
     const compositionId = el.getAttribute("data-composition-id");
     if (compositionId) return `[data-composition-id="${CSS.escape(compositionId)}"]`;
     const compositionSrc = el.getAttribute("data-composition-src");
@@ -142,8 +146,7 @@ export function createPickerModule(deps: PickerModuleDeps): PickerModule {
     if (blocksPickerAtPoint(raw[0] ?? null)) return [];
     const dedupe: Record<string, true> = {};
     const candidates: Element[] = [];
-    for (let i = 0; i < raw.length; i += 1) {
-      const node = raw[i];
+    for (const [i, node] of raw.entries()) {
       if (!isPickableElement(node)) continue;
       const key = `${node.tagName}::${(node as HTMLElement).id || ""}::${i}`;
       if (dedupe[key]) continue;
@@ -157,8 +160,7 @@ export function createPickerModule(deps: PickerModuleDeps): PickerModule {
   function extractElementInfo(el: Element): RuntimePickerElementInfo {
     const rect = el.getBoundingClientRect();
     const dataAttributes: Record<string, string> = {};
-    for (let i = 0; i < el.attributes.length; i += 1) {
-      const attr = el.attributes[i];
+    for (const attr of Array.from(el.attributes)) {
       if (attr.name.startsWith("data-")) {
         dataAttributes[attr.name] = attr.value;
       }
@@ -187,7 +189,7 @@ export function createPickerModule(deps: PickerModuleDeps): PickerModule {
   function onPickMouseMove(event: MouseEvent): void {
     if (!pickModeActive) return;
     const candidates = getPickCandidatesFromPoint(event.clientX, event.clientY, 1);
-    const target = candidates[0] ?? (event.target instanceof Element ? event.target : null);
+    const target = candidates[0] ?? (isElementNode(event.target) ? event.target : null);
     if (!isPickableElement(target)) return;
     if (pickModeHighlightEl === target) return;
     if (pickModeHighlightEl) {

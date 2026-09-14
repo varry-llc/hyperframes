@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type MutableRefObject } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { openComposition, type Composition, type CompositionVariable } from "@hyperframes/sdk";
 import { persistSdkSerialize } from "../utils/sdkCutover";
 import type { EditHistoryKind } from "../utils/editHistory";
@@ -87,7 +87,6 @@ interface EditVariablesDeps {
   writeProjectFile: (path: string, content: string) => Promise<void>;
   recordEdit: RecordEditFn;
   reloadPreview: () => void;
-  domEditSaveTimestampRef: MutableRefObject<number>;
 }
 
 /**
@@ -98,34 +97,32 @@ interface EditVariablesDeps {
  * but keyed on `path` rather than a live session.
  */
 export function useEditVariablesInFile(deps: EditVariablesDeps) {
-  const { readProjectFile, writeProjectFile, recordEdit, reloadPreview, domEditSaveTimestampRef } =
-    deps;
+  const { readProjectFile, writeProjectFile, recordEdit, reloadPreview } = deps;
   return useCallback(
     async (path: string, label: string, mutate: (session: Composition) => void): Promise<void> => {
       const originalContent = await readProjectFile(path);
-      const comp = await openComposition(originalContent, { history: false });
-      let after: string;
-      try {
-        mutate(comp);
-        after = comp.serialize();
-      } finally {
-        comp.dispose();
-      }
-      if (after === originalContent) return;
       await persistSdkSerialize(
-        after,
+        async (onDiskBefore) => {
+          const comp = await openComposition(onDiskBefore, { history: false });
+          try {
+            mutate(comp);
+            return comp.serialize();
+          } finally {
+            comp.dispose();
+          }
+        },
         path,
         originalContent,
         {
           editHistory: { recordEdit },
           writeProjectFile,
           reloadPreview,
-          domEditSaveTimestampRef,
           compositionPath: path,
+          readProjectFile,
         },
         { label },
       );
     },
-    [readProjectFile, writeProjectFile, recordEdit, reloadPreview, domEditSaveTimestampRef],
+    [readProjectFile, writeProjectFile, recordEdit, reloadPreview],
   );
 }

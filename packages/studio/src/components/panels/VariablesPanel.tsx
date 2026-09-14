@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useState, type MutableRefObject } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import type {
   Composition,
   CompositionVariable,
@@ -6,6 +6,7 @@ import type {
   VariableValidationIssue,
 } from "@hyperframes/sdk";
 import type { EditHistoryKind } from "../../utils/editHistory";
+import type { PublishSdkSession } from "../../utils/sdkCutover";
 import { useStudioPlaybackContext, useStudioShellContext } from "../../contexts/StudioContext";
 import { useDomEditContext } from "../../contexts/DomEditContext";
 import { useFileManagerContext } from "../../contexts/FileManagerContext";
@@ -30,16 +31,18 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-interface VariablesPanelProps {
+export interface StudioEditPersistenceProps {
   sdkSession: Composition | null;
+  publishSdkSession: PublishSdkSession;
   reloadPreview: () => void;
-  domEditSaveTimestampRef: MutableRefObject<number>;
   recordEdit: (entry: {
     label: string;
     kind: EditHistoryKind;
     files: Record<string, { before: string; after: string }>;
   }) => Promise<void>;
 }
+
+type VariablesPanelProps = StudioEditPersistenceProps;
 
 function formatIssue(issue: VariableValidationIssue): string {
   switch (issue.kind) {
@@ -247,8 +250,8 @@ const EMPTY_STATE = (
 // fallow-ignore-next-line complexity
 export const VariablesPanel = memo(function VariablesPanel({
   sdkSession,
+  publishSdkSession,
   reloadPreview,
-  domEditSaveTimestampRef,
   recordEdit,
 }: VariablesPanelProps) {
   const { activeCompPath, showToast } = useStudioShellContext();
@@ -284,7 +287,7 @@ export const VariablesPanel = memo(function VariablesPanel({
     writeProjectFile,
     recordEdit,
     reloadPreview,
-    domEditSaveTimestampRef,
+    publishSdkSession,
   });
 
   const declarations = useMemo(
@@ -546,7 +549,6 @@ export const VariablesPanel = memo(function VariablesPanel({
           writeProjectFile={writeProjectFile}
           recordEdit={recordEdit}
           reloadPreview={reloadPreview}
-          domEditSaveTimestampRef={domEditSaveTimestampRef}
         />
       </div>
     </div>

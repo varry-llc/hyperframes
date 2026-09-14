@@ -3,11 +3,11 @@ name: remotion-to-hyperframes
 description: 'Port an existing Remotion (React) composition''s source to HyperFrames HTML. Use ONLY on an explicit ask to port/convert/migrate/translate a Remotion source — one-way, Remotion-only. A passing Remotion mention, reference-only code, or "make something like my Remotion video" is a fresh build (/general-video). Unclear → /hyperframes.'
 ---
 
-> **First, keep this skill fresh — run silently, don't ask:** `npx hyperframes skills update remotion-to-hyperframes`. A fast no-op when everything is current; otherwise it refreshes this skill plus the core domain skills it depends on before you rely on them.
+> **First, keep this skill fresh — confirm with the user before running:** `npx hyperframes skills update remotion-to-hyperframes`. A fast no-op when everything is current; otherwise it refreshes this skill plus the core domain skills it depends on before you rely on them.
 
 # Remotion to HyperFrames
 
-> **Confirm the route before you build.** Use this **only** to port an existing **Remotion** (React) composition's source into HyperFrames. Authoring a **new** composition (even one inspired by a Remotion video) → the creation workflows / `/general-video`. **Out of scope** (one-way, Remotion-only): no reverse export (HyperFrames → Remotion or any framework), and a **non-Remotion** source (After Effects, Framer Motion, plain React / CSS) has no Remotion source to translate → re-create via `/general-video`. Unsure, or only a passing Remotion mention? **Read `/hyperframes` first.**
+> **The front door is `/hyperframes`.** Use this **only** to port an existing **Remotion** (React) composition's source into HyperFrames, one way. Authoring a **new** composition, re-creating from a non-Remotion source (After Effects, Framer Motion, plain React / CSS — there is no Remotion source to translate), a passing Remotion mention, or any uncertainty → read `/hyperframes` first: the intent layer owns every route decision.
 
 ## Overview
 
@@ -66,6 +66,8 @@ Read [`references/api-map.md`](references/api-map.md) — the index of every Rem
 | `@remotion/google-fonts/<Family>`, `Font.loadFont`, `@font-face`          | [`fonts.md`](references/fonts.md)             |
 
 Don't load all of them — load only what the specific source needs.
+
+**Search the live catalog for any visual effect the table does not map.** When the source paints a look with no HF API equivalent — a scanline/CRT overlay, a glitch or chromatic-aberration pass, a shader wipe, a film-grain treatment — run `npx hyperframes catalog --query "<the effect, in plain English>" --json` before hand-writing it in GSAP. The search needs **nothing installed**: no project, no prior `add`, no account. It ranks the whole hosted registry (~400 blocks and components) from any directory, and `transitions.md` already takes this route for `clockWipe()` / `iris()` via `npx hyperframes add sdf-iris`. A real component is closer to the source than a hand-approximation, so it usually raises the SSIM rather than lowering it — but the render diff in Step 4 is still the arbiter. Hand-write the effect when a search returns nothing that fits, and record the substitution in `TRANSLATION_NOTES.md` either way.
 
 ### Step 3: Generate the HF composition
 
