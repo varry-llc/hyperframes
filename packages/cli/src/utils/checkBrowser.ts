@@ -52,6 +52,7 @@ import type {
   OffPivotRotationSample,
   RotationSample,
   RunAuditGrid,
+  SeekClock,
 } from "./checkTypes.js";
 import type { ProjectDir } from "./project.js";
 
@@ -63,6 +64,7 @@ interface RuntimeDraft {
   url?: string;
   line?: number;
   count?: number;
+  abortedImage?: boolean;
 }
 
 interface AnchorRequest {
@@ -121,7 +123,7 @@ export async function preResolveHostileMediaProxies(
   try {
     codecMap = await scanProjectMediaCodecMap(projectDir, [{ html }]);
   } catch (err) {
-    console.info(
+    console.error(
       `[hyperframes] media proxy pre-resolve: scan failed (${normalizeErrorMessage(err)})`,
     );
     return;
@@ -142,7 +144,7 @@ export async function preResolveHostileMediaProxies(
     ),
   );
   const failed = results.filter((result) => result.status === "rejected").length;
-  console.info(
+  console.error(
     `[hyperframes] media proxy pre-resolve: ${results.length - failed}/${results.length} ready, ${failed} failed (${Date.now() - startedAt}ms)`,
   );
 }
@@ -195,10 +197,13 @@ export async function runBrowserCheck(
       currentTime = time;
     });
     const result = await runGrid(driver, options, motion);
+    const broken = await abortedImagesStillBroken(page, drafts);
     return {
       ...result,
       timings: { ...result.timings, launchSettleMs },
-      runtimeFindings: drafts.map((draft) => runtimeFinding(draft, rootAnchor)),
+      runtimeFindings: keepBrokenImageAborts(drafts, broken).map((draft) =>
+        runtimeFinding(draft, rootAnchor),
+      ),
     };
   } finally {
     await chromeBrowser?.close().catch(() => undefined);
@@ -367,6 +372,46 @@ function wireRuntimeListeners(page: Page, drafts: RuntimeDraft[], currentTime: (
   wireNetworkListeners(page, drafts, currentTime);
 }
 
+/** Check's scrubs cancel image loads: an aborted image failed only if an `<img>` shows it and its decode fails. */
+export function keepBrokenImageAborts(drafts: RuntimeDraft[], broken: Set<string>): RuntimeDraft[] {
+  return drafts.filter((draft) => !draft.abortedImage || broken.has(draft.url ?? ""));
+}
+
+const IMAGE_DECODE_CAP_MS = 5000;
+
+async function abortedImagesStillBroken(page: Page, drafts: RuntimeDraft[]): Promise<Set<string>> {
+  const urls = drafts.filter((draft) => draft.abortedImage).map((draft) => draft.url ?? "");
+  if (urls.length === 0) return new Set();
+  const broken = await page.evaluate(
+    async (candidates: string[], capMs: number) => {
+      // A load still pending at the cap (a deferred lazy image) is not a failure.
+      const fails = (img: HTMLImageElement) =>
+        new Promise<boolean>((resolve) => {
+          const cap = setTimeout(() => resolve(false), capMs);
+          img
+            .decode()
+            .then(
+              () => resolve(false),
+              () => resolve(true),
+            )
+            .finally(() => clearTimeout(cap));
+        });
+      const stillBroken = await Promise.all(
+        candidates.map(async (url) => {
+          const shown = Array.from(document.querySelectorAll("img")).filter(
+            (img) => img.currentSrc === url || img.src === url,
+          );
+          return (await Promise.all(shown.map(fails))).some(Boolean);
+        }),
+      );
+      return candidates.filter((_, i) => stillBroken[i]);
+    },
+    urls,
+    IMAGE_DECODE_CAP_MS,
+  );
+  return new Set(broken);
+}
+
 function wireNetworkListeners(page: Page, drafts: RuntimeDraft[], currentTime: () => number): void {
   page.on("requestfailed", (request) => {
     const url = request.url();
@@ -379,6 +424,7 @@ function wireNetworkListeners(page: Page, drafts: RuntimeDraft[], currentTime: (
       message: `Failed to load ${urlPath(url)}: ${failure ?? "net::ERR_FAILED"}`,
       time: currentTime(),
       url,
+      abortedImage: failure === "net::ERR_ABORTED" && request.resourceType() === "image",
     });
   });
   page.on("response", (response) => {
@@ -416,6 +462,7 @@ function createPageDriver(page: Page, setTime: (time: number) => void): CheckAud
     collectLayout: (time, tolerance, layout) => collectLayout(page, time, tolerance, layout),
     collectOverlap: (time) => collectOverlap(page, time),
     collectLayoutGeometry: () => collectLayoutGeometry(page),
+    collectSeekClock: () => collectSeekClock(page),
     collectRotationSample: (time) => collectRotationSample(page, time),
     collectOffPivotRotationSample: (time) => collectOffPivotRotationSample(page, time),
     collectGeometryCandidates: (time, request) => collectGeometryCandidates(page, time, request),
@@ -434,6 +481,7 @@ async function hasNoTimelineDeclaration(page: Page): Promise<boolean> {
 }
 
 async function injectAuditScripts(page: Page, contrast: boolean): Promise<void> {
+  await page.addScriptTag({ content: loadBrowserScript("motion-signature.browser.js") });
   await page.addScriptTag({ content: loadBrowserScript("layout-audit.browser.js") });
   await page.addScriptTag({ content: loadBrowserScript("motion-sample.browser.js") });
   if (contrast) {
@@ -563,6 +611,56 @@ async function collectLayoutGeometry(page: Page): Promise<string> {
     if (typeof geometry !== "function") return "";
     const result = Reflect.apply(geometry, window, []);
     return typeof result === "string" ? result : "";
+  });
+}
+
+export async function collectSeekClock(page: Page): Promise<SeekClock[]> {
+  // Serialized into the page; each optional GSAP read is one branch of one function.
+  // fallow-ignore-next-line complexity
+  return page.evaluate(() => {
+    const callOrUndefined = (target: unknown, key: string, args: unknown[] = []): unknown => {
+      try {
+        return Reflect.apply(Reflect.get(Object(target), key), target, args);
+      } catch {
+        return undefined;
+      }
+    };
+    const known: { ids: WeakMap<object, number>; next: number } = Reflect.get(
+      window,
+      "__hfSeekClocks",
+    ) ?? {
+      ids: new WeakMap(),
+      next: 0,
+    };
+    Reflect.set(window, "__hfSeekClocks", known);
+    const idOf = (target: object): number => {
+      if (!known.ids.has(target)) known.ids.set(target, ++known.next);
+      return known.ids.get(target) ?? 0;
+    };
+    const clocks: SeekClock[] = [];
+    const timelines: unknown = Reflect.get(window, "__timelines");
+    const registered = typeof timelines === "object" && timelines ? Object.values(timelines) : [];
+    const gsapRoot = Reflect.get(Reflect.get(window, "gsap") ?? {}, "globalTimeline");
+    const children = callOrUndefined(gsapRoot, "getChildren", [false, true, true]);
+    for (const timeline of [...registered, ...(Array.isArray(children) ? children : [])]) {
+      const total = Number(
+        callOrUndefined(timeline, "totalDuration") ?? callOrUndefined(timeline, "duration"),
+      );
+      if (typeof timeline !== "object" || !timeline || !(total > 0)) continue;
+      const time = callOrUndefined(timeline, "totalTime") ?? callOrUndefined(timeline, "time");
+      if (typeof time !== "number" || !Number.isFinite(time)) continue;
+      const progress = Number(callOrUndefined(timeline, "totalProgress") ?? time / total);
+      const done = callOrUndefined(timeline, "reversed") === true ? progress <= 0 : progress >= 1;
+      clocks.push({ id: idOf(timeline), time, done });
+    }
+    for (const animation of document.getAnimations?.() ?? []) {
+      if (typeof animation.currentTime !== "number") continue;
+      const time = animation.currentTime;
+      const end = Number(animation.effect?.getComputedTiming().endTime ?? Number.POSITIVE_INFINITY);
+      const atEnd = animation.playbackRate < 0 ? time <= 0 : time >= end;
+      clocks.push({ id: idOf(animation), time, done: animation.playState === "finished" || atEnd });
+    }
+    return clocks;
   });
 }
 
@@ -1225,6 +1323,7 @@ const LAYOUT_ISSUE_CODES: readonly LayoutIssueCode[] = [
   "frame_out_of_frame",
   "escaped_container",
   "panel_out_of_canvas",
+  "canvas_content_at_edge",
   "connector_detached",
   "connector_orphan",
   "rotation_pivot_drift",

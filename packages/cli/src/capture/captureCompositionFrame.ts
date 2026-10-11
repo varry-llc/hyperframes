@@ -1,10 +1,12 @@
+import { launchManagedBrowser, resolveManagedGpuMode } from "../browser/launch.js";
 import { spawn } from "node:child_process";
 import type { Browser, Page } from "puppeteer-core";
 import { c } from "../ui/colors.js";
 import {
-  assertWebGpuRequirement,
-  resolveCaptureBrowserGpuMode,
+  assertWebGpuAdapterAvailable,
+  compositionRequiresWebGpu,
   resolveLocalBrowserGpuMode,
+  resolveLocalWebGpu,
   type BrowserGpuMode,
 } from "../browser/gpuPolicy.js";
 import { windowsChromeCrashRemediation } from "../browser/windowsCrash.js";
@@ -36,6 +38,7 @@ export const DENSE_GEOMETRY_SEEK_OPTIONS = {
 
 export interface SeekCompositionTimelineOptions {
   fallbackToBridgeAndTimelines?: boolean;
+  exactTime?: boolean;
   waitForPreferredSeekTargetMs?: number;
   animationFrameSettle?: "race" | "double" | "none";
   waitForFontsMs?: number;
@@ -46,13 +49,14 @@ type CompositionPageFunction =
   | string
   | (() => unknown)
   | ((value: number) => unknown)
-  | ((value: number, fallbackToBridgeAndTimelines: boolean) => unknown);
+  | ((value: number, fallbackToBridgeAndTimelines: boolean, exactTime: boolean) => unknown);
 
 export interface CompositionEvaluationPage {
   evaluate(
     pageFunction: CompositionPageFunction,
     value?: number,
     fallbackToBridgeAndTimelines?: boolean,
+    exactTime?: boolean,
   ): Promise<unknown>;
 }
 
@@ -93,7 +97,10 @@ export function resolveCliChromeGpuMode(
 }
 
 function compositionRuntimeReadyInBrowser(): boolean {
-  return Boolean(Reflect.get(window, "__renderReady"));
+  return (
+    Boolean(Reflect.get(window, "__renderReady")) ||
+    typeof Reflect.get(window, "__hfStartupError") === "string"
+  );
 }
 
 function shaderTransitionsReadyInBrowser(): boolean {
@@ -122,14 +129,26 @@ function shaderTransitionsReadyInBrowser(): boolean {
   return shaderTransitionRegistryReady() ?? shaderLoadingOverlayReady();
 }
 
+export async function waitForRuntimeReady(
+  page: Required<Pick<CompositionSeekPage, "waitForFunction" | "evaluate">>,
+  timeoutMs: number,
+): Promise<boolean> {
+  const settled = await page
+    .waitForFunction(compositionRuntimeReadyInBrowser, { timeout: timeoutMs })
+    .then(() => true)
+    .catch(() => false);
+  const startupError = await page
+    .evaluate(() => Reflect.get(window, "__hfStartupError"))
+    .catch(() => undefined);
+  if (typeof startupError === "string") throw new Error(startupError);
+  return settled;
+}
+
 async function waitForCompositionSettle(
   page: Page,
   options: OpenSettledCompositionPageOptions,
 ): Promise<boolean> {
-  const runtimeReady = await page
-    .waitForFunction(compositionRuntimeReadyInBrowser, { timeout: options.renderReadyTimeoutMs })
-    .then(() => true)
-    .catch(() => false);
+  const runtimeReady = await waitForRuntimeReady(page, options.renderReadyTimeoutMs);
 
   if (!runtimeReady) {
     console.warn(
@@ -174,15 +193,18 @@ export async function openSettledCompositionPage(
   const puppeteer = await import("puppeteer-core");
   const { buildChromeArgs } = await import("@hyperframes/engine");
   const requestedGpuMode = options.browserGpuMode ?? resolveCliChromeGpuMode();
+  const requiresWebGpu = compositionRequiresWebGpu(html);
+  let softwareWebGpu = false;
   const launch = async (executablePath: string): Promise<Browser> => {
-    const resolvedGpuMode = await resolveCaptureBrowserGpuMode(requestedGpuMode, executablePath);
-    assertWebGpuRequirement(html, requestedGpuMode, resolvedGpuMode);
-    return puppeteer.default.launch({
+    const resolvedGpuMode = await resolveManagedGpuMode(requestedGpuMode, executablePath);
+    const webGpu = resolveLocalWebGpu(resolvedGpuMode, requiresWebGpu);
+    softwareWebGpu = webGpu.softwareWebGpu;
+    return launchManagedBrowser(puppeteer.default, {
       headless: true,
       executablePath,
       args: buildChromeArgs(
-        { ...viewport, captureMode: "screenshot" },
-        { browserGpuMode: resolvedGpuMode },
+        { ...viewport, captureMode: "screenshot", requiresWebGpu },
+        webGpu.gpuConfig,
       ),
     });
   };
@@ -225,6 +247,7 @@ export async function openSettledCompositionPage(
       waitUntil: "domcontentloaded",
       timeout: resolveDiagnosticNavigationTimeoutMs(process.env, options.navigationTimeoutMs),
     });
+    await assertWebGpuAdapterAvailable(page, requiresWebGpu, softwareWebGpu);
     const renderReadyTimedOut = !(await waitForCompositionSettle(page, options));
     return { browser: chromeBrowser, page, renderReadyTimedOut };
   } catch (err) {
@@ -245,7 +268,7 @@ export async function seekCompositionTimeline(
   await page.evaluate(
     // Serialized into the page; the seek-target cascade must stay one function.
     // fallow-ignore-next-line complexity
-    (t: number, fallbackToBridgeAndTimelines: boolean) => {
+    (t: number, fallbackToBridgeAndTimelines: boolean, exactTime: boolean) => {
       const getProperty = (target: unknown, key: string): unknown => {
         if ((typeof target !== "object" || target === null) && typeof target !== "function") {
           return undefined;
@@ -269,7 +292,7 @@ export async function seekCompositionTimeline(
 
       // Prefer renderSeek because it also runs the runtime's data-start/data-duration
       // visibility sync; raw timeline seeks leave off-window clips visible to audits.
-      if (call(renderSeek, player, [safe])) {
+      if (call(renderSeek, player, exactTime ? [safe, { exact: true }] : [safe])) {
         // Preferred runtime target handled the seek.
       } else if (fallbackToBridgeAndTimelines && call(bridgeSeek, hf, [safe])) {
         // Producer bridge handled the seek.
@@ -292,6 +315,7 @@ export async function seekCompositionTimeline(
     },
     timeSeconds,
     options.fallbackToBridgeAndTimelines === true,
+    options.exactTime === true,
   );
 
   await page.evaluate(async () => {

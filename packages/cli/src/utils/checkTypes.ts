@@ -4,6 +4,7 @@ import type { Canvas, MotionFrame } from "./motionAudit.js";
 import type { MotionSpec } from "./motionSpec.js";
 import type { ProjectDir } from "./project.js";
 import type { BrowserGpuMode } from "../browser/gpuPolicy.js";
+import type { HdrAutoPromotion } from "@hyperframes/engine";
 
 export interface CheckOptions {
   samples: number;
@@ -49,6 +50,12 @@ export interface LayoutOptions {
 
 export type CheckSeverity = "error" | "warning" | "info";
 
+export interface SeekClock {
+  id: number;
+  time: number;
+  done: boolean;
+}
+
 export interface CheckBbox {
   x: number;
   y: number;
@@ -62,6 +69,7 @@ export interface CheckAnchor {
   sourceFile: string;
   bbox: CheckBbox;
   time: number;
+  times?: number[];
 }
 
 export interface CheckFinding extends CheckAnchor {
@@ -194,10 +202,10 @@ export interface CheckAuditDriver {
   ): Promise<AnchoredLayoutIssue[]>;
   /** content_overlap only, for the dense re-sampling grid — catches transient text collisions the sparse grid seeks past. */
   collectOverlap(time: number): Promise<AnchoredLayoutIssue[]>;
-  /** Frozen-sweep guard (#U10): an opaque per-sample geometry+opacity
-   * fingerprint of the current seeked state, for detecting a timeline that
-   * never advances under seek. See layout-audit.browser.js. */
+  /** Frozen-sweep guard (#U10): an opaque fingerprint of the seeked visual state, from
+   * motion-signature.browser.js (shared with motion-sample's liveness). Legacy name kept. */
   collectLayoutGeometry(): Promise<string>;
+  collectSeekClock(): Promise<SeekClock[]>;
   /** rotation_pivot_drift: every rotatable element's bbox center/size/angle at
    * the current seeked state. Accumulated across the grid — see checkPipeline. */
   collectRotationSample(time: number): Promise<RotationSample[]>;
@@ -244,6 +252,7 @@ export interface CheckBrowserResult {
   contrastPassed: number;
   screenshots: CheckScreenshot[];
   timings: CheckTimings;
+  skipped: boolean;
 }
 
 /** The seek-grid audit loop, injected into checkBrowser so it never imports checkPipeline back. */
@@ -264,6 +273,7 @@ export interface CheckSection<T extends CheckFinding = CheckFinding> {
 export interface CheckReport {
   ok: boolean;
   strict: boolean;
+  browserSkipped: boolean;
   lint: CheckSection & { filesScanned: number };
   runtime: CheckSection;
   layout: CheckSection<AnchoredLayoutIssue> & {
@@ -282,6 +292,7 @@ export interface CheckReport {
     checked: number;
     passed: number;
   };
+  hdr: { autoPromotion: HdrAutoPromotion | null; inspection: "available" | "unavailable" };
   snapshots: { enabled: boolean; files: string[]; times: number[]; findingFiles: string[] };
 }
 
@@ -304,6 +315,7 @@ export interface CheckDependencies {
     options: CheckOptions,
     requests: CheckFindingCropRequest[],
   ): Promise<string[]>;
+  inspectHdrAutoPromotion?(project: ProjectDir): Promise<CheckReport["hdr"]["autoPromotion"]>;
 }
 
 export function rectToBbox(rect: {

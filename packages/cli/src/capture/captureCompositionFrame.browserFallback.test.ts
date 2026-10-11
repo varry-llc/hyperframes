@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -6,6 +7,10 @@ const mocks = vi.hoisted(() => ({
   launch: vi.fn(),
   buildChromeArgs: vi.fn(() => []),
   resolveBrowserGpuMode: vi.fn(async () => "software" as const),
+  compositionRequiresWebGpu: vi.fn(() => false),
+  assertWebGpuAdapterAvailable: vi.fn(async () => undefined),
+  resolveConfig: vi.fn(),
+  usesSoftwareWebGpu: vi.fn(),
 }));
 
 vi.mock("../browser/manager.js", () => ({
@@ -15,9 +20,16 @@ vi.mock("../browser/manager.js", () => ({
 
 vi.mock("puppeteer-core", () => ({ default: { launch: mocks.launch } }));
 
+// captureCompositionFrame.js imports these two from ../browser/gpuPolicy.js,
+// which re-exports them from this mocked module — unmocked here, they'd read
+// undefined and throw as soon as openSettledCompositionPage calls them.
 vi.mock("@hyperframes/engine", () => ({
   buildChromeArgs: mocks.buildChromeArgs,
   resolveBrowserGpuMode: mocks.resolveBrowserGpuMode,
+  compositionRequiresWebGpu: mocks.compositionRequiresWebGpu,
+  assertWebGpuAdapterAvailable: mocks.assertWebGpuAdapterAvailable,
+  resolveConfig: mocks.resolveConfig,
+  usesSoftwareWebGpu: mocks.usesSoftwareWebGpu,
 }));
 
 import { openSettledCompositionPage } from "./captureCompositionFrame.js";
@@ -47,6 +59,7 @@ function fakeBrowser() {
     browser: {
       newPage: vi.fn(async () => page),
       close: vi.fn(async () => undefined),
+      process: vi.fn(() => new EventEmitter()),
     },
     page,
   };
@@ -62,11 +75,31 @@ describe("openSettledCompositionPage Windows bundled-browser recovery", () => {
     mocks.findSystemBrowser.mockReturnValue({ executablePath: SYSTEM, source: "system" });
     mocks.buildChromeArgs.mockReturnValue([]);
     mocks.resolveBrowserGpuMode.mockResolvedValue("software");
+    mocks.resolveConfig.mockReturnValue({ allowSoftwareWebGpu: false });
+    mocks.usesSoftwareWebGpu.mockReturnValue(false);
   });
 
   afterEach(() => {
     vi.useRealTimers();
     if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+  });
+
+  it("launches software WebGPU and accepts its adapter when render's opt-in is set", async () => {
+    const opened = fakeBrowser();
+    mocks.launch.mockResolvedValueOnce(opened.browser);
+    mocks.compositionRequiresWebGpu.mockReturnValue(true);
+    mocks.resolveConfig.mockReturnValue({ allowSoftwareWebGpu: true });
+    mocks.usesSoftwareWebGpu.mockReturnValue(true);
+
+    await openSettledCompositionPage(HTML, "http://127.0.0.1:3000", OPTIONS);
+
+    const gpuConfig = { browserGpuMode: "software", allowSoftwareWebGpu: true };
+    expect(mocks.buildChromeArgs).toHaveBeenCalledWith(
+      expect.objectContaining({ requiresWebGpu: true }),
+      gpuConfig,
+    );
+    expect(mocks.usesSoftwareWebGpu).toHaveBeenCalledWith(true, gpuConfig);
+    expect(mocks.assertWebGpuAdapterAvailable).toHaveBeenCalledWith(opened.page, true, true);
   });
 
   it("retries the known managed-shell crash once with system Chrome", async () => {
